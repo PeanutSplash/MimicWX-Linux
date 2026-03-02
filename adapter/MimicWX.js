@@ -190,7 +190,7 @@ Bot.adapter.push(
         getGroupMemberMap: () => new Map(),
 
         sendApi: () => { throw new Error("MimicWX 不支持 sendApi") },
-        version: { id: this.id, name: this.name, version: status.version || "0.4.0" },
+        version: { id: this.id, name: this.name, version: status.version || "0.5.0" },
       }
 
       if (!Bot.uin.includes(this.self_id)) Bot.uin.push(this.self_id)
@@ -212,7 +212,6 @@ Bot.adapter.push(
         const isGroup = data.chat && data.chat.includes("@chatroom")
         const user_id = data.talker || data.chat
         const group_id = isGroup ? data.chat : undefined
-        console.log(`[MimicWX DEBUG] user_id=${user_id} | talker=${data.talker} | chat=${data.chat}`)
         const bot = Bot[this.self_id]
 
         // 动态更新联系人/群映射 (确保 pickGroup/pickFriend 能找到正确的显示名)
@@ -263,32 +262,6 @@ Bot.adapter.push(
         }
 
         Bot.em(`message.${e.message_type}`, e)
-      }
-
-      // listen_message: AT-SPI 监听窗口消息
-      if (data.type === "listen_message") {
-        const e = {
-          self_id: this.self_id,
-          bot: Bot[this.self_id],
-          post_type: "message",
-          message_type: "private",
-          user_id: data.sender || data.from,
-          sender: {
-            user_id: data.sender || data.from,
-            nickname: data.sender || data.from,
-          },
-          message: [{ type: "text", text: data.content }],
-          raw_message: data.content,
-          time: Math.floor(Date.now() / 1000),
-          message_id: `mimicwx_listen_${Date.now()}`,
-        }
-
-        e.reply = (msg) => this.sendMsgSmart(data.from, msg)
-
-        Bot.makeLog("info", `监听消息 [${data.from}] ${data.sender}: ${data.content}`,
-          this.self_id)
-
-        Bot.em("message.private", e)
       }
 
       // sent: 发送确认

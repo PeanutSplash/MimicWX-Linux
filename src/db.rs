@@ -458,7 +458,7 @@ impl DbManager {
 
                         for (id, name) in rows {
                             if !id.is_empty() && !name.is_empty() {
-                                info!("👥 chat_room 补充: {} → {}", id, name);
+                                debug!("👥 chat_room 补充: {} → {}", id, name);
                                 result.push((id, name));
                             }
                         }
@@ -501,6 +501,7 @@ impl DbManager {
                 *self.self_display_name.write().await = name;
             }
         }
+
 
         Ok(count)
     }
@@ -586,7 +587,7 @@ impl DbManager {
                 .map(|g| g.clone())
                 .unwrap_or_default()
         };
-
+        // 复用持久化的 Name2Id MD5 缓存 (避免每次从 DB 重建)
         let (raw_msgs, new_watermarks, updated_meta) = tokio::task::spawn_blocking(move || -> Result<(Vec<RawMsg>, HashMap<String, i64>, HashMap<String, TableMeta>)> {
             let mut all_msgs = Vec::new();
             let mut wm = current_watermarks;
@@ -682,12 +683,14 @@ impl DbManager {
             Ok((all_msgs, wm, meta_cache))
         }).await??;
 
-        // 回写表结构缓存 (首次构建后不再变化)
+        // 回写表结构缓存
         if let Ok(mut cache) = self.table_meta_cache.lock() {
             for (k, v) in updated_meta {
                 cache.entry(k).or_insert(v);
             }
         }
+
+
 
         // 更新高水位线
         if !raw_msgs.is_empty() {
@@ -856,7 +859,7 @@ impl DbManager {
                                 content_trimmed.contains(&text_owned)
                                 || text_owned.contains(content_trimmed)
                             ) {
-                                info!("✅ [DB] 发送验证成功: \"{}\"", text_owned);
+                                info!("✅ [DB] 发送验证成功");
                                 return Ok(true);
                             }
                         }
@@ -868,7 +871,7 @@ impl DbManager {
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    warn!("⚠️ [DB] 发送验证超时 (5s): \"{}\"", text_owned);
+                    warn!("⚠️ [DB] 发送验证超时 (5s)");
                     break;
                 }
             }

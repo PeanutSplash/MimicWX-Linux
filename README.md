@@ -8,16 +8,14 @@
 
 ## ✨ 特性
 
-- 🔍 **双通道消息检测**
-  - **数据库通道** (主) — SQLCipher 解密 WCDB + fanotify WAL 实时监听，亚秒级延迟
-  - **AT-SPI2 通道** (备) — 无障碍接口读取 UI 消息列表，无需注入进程
-- ⌨️ **X11 XTEST 输入注入** — 通过 XTEST 扩展直接注入键鼠事件，零 Synthetic 标记，原生X11窗口管理
-- 🔑 **GDB 自动密钥提取** — 在 `setCipherKey` 偏移处设断点，用户扫码登录后自动从寄存器捕获 32 字节 AES 密钥
-- 💬 **独立聊天窗口** — 借鉴 [wxauto](https://github.com/cluic/wxauto) 的 ChatWnd 设计，支持多窗口并行收发消息
-- 🔌 **REST + WebSocket API** — 完整的 HTTP API 和 WebSocket 实时推送 (30s 心跳保活)，CORS 全开放，可对接 Yunzai 等机器人框架
+- 🔍 **数据库消息检测** — SQLCipher 解密 WCDB + fanotify WAL 实时监听，亚秒级延迟，支持文本/图片/语音/视频/链接等 13+ 种消息类型解析
+- ⌨️ **X11 原生输入注入** — XTEST 扩展注入键鼠事件 + X11 Selection 协议直接操作剪贴板（零外部进程依赖），原生窗口管理
+- 🔑 **GDB 自动密钥提取** — 在 `setCipherKey` 偏移处设断点，扫码登录后自动从寄存器捕获 32 字节 AES 密钥
+- 💬 **独立聊天窗口** — 借鉴 [wxauto](https://github.com/cluic/wxauto) 的 ChatWnd 设计，支持多窗口并行收发 + 缓存节点自动失效重建
+- 🔌 **REST + WebSocket API** — 完整 HTTP API + WebSocket 实时推送 (30s 心跳保活)，CORS 全开放，可对接 Yunzai 等机器人框架
 - 🐳 **Docker 一键部署** — 多阶段构建 + Xvfb/VNC 虚拟桌面，开箱即用
 - 🔒 **Token 认证** — 支持 Bearer Token 认证保护 API 安全
-- 🖥️ **交互式控制台** — 支持 `/restart`、`/stop`、`/status`、`/refresh`、`/help` 命令，方向键切换历史命令
+- 🖥️ **交互式控制台** — 支持 `/restart`、`/stop`、`/status`、`/refresh`、`/help` 命令，方向键切换历史
 - 💡 **自动弹性** — AT-SPI2 心跳自动重连、联系人定时刷新、优雅重启/关闭
 
 ---
@@ -40,7 +38,7 @@
 │  │  └────────────────────────────────────────────────────────────────┘   │ │
 │  │                                                                       │ │
 │  │  ┌── 输入控制层 ──────────────────────────────────────────────────┐   │ │
-│  │  │  input.rs: X11 XTEST 键鼠注入 + xclip 剪贴板 + 窗口管理       │   │ │
+│  │  │  input.rs: X11 XTEST 键鼠注入 + X11 Selection 剪贴板 + 窗口管理│   │ │
 │  │  └────────────────────────────────────────────────────────────────┘   │ │
 │  │                                                                       │ │
 │  │  ┌── 业务逻辑层 ──────────────────────────────────────────────────┐   │ │
@@ -61,7 +59,7 @@
 └───────────────────────────────────────────────────────────────────────────┘
 
 ┌─ 外部对接 ────────────────────────────────────────────────────────────────┐
-│  adapter/MimicWX.js: Yunzai-Bot 适配器 (REST + WebSocket 双通道)         │
+│  adapter/MimicWX.js: Yunzai-Bot 适配器 (REST + WebSocket)                │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -114,12 +112,12 @@ MimicWX-Linux/
 | 能力 | 说明 |
 |------|------|
 | **键盘** | 单键按下 / 组合键 (`Ctrl+V`, `Ctrl+A` 等) / ASCII 逐字输入 |
-| **中文输入** | `xclip` 写入剪贴板 → `Ctrl+V` 粘贴 (绕过输入法) |
+| **中文输入** | X11 Selection 协议直接设置剪贴板 → `Ctrl+V` 粘贴 (零外部进程) |
 | **图片发送** | `xclip -selection clipboard -t image/png` → `Ctrl+V` 粘贴 |
 | **鼠标** | 移动 / 单击 / 双击 / 右键 / 滚轮 |
 | **窗口管理** | X11 原生 `_NET_ACTIVE_WINDOW` 激活 / `_NET_CLOSE_WINDOW` 关闭 (替代 xdotool) |
 
-### `db.rs` — 数据库监听 (1332 行核心模块)
+### `db.rs` — 数据库监听
 
 SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 
@@ -142,10 +140,10 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 |------|------|
 | **状态检测** | 通过 `[tool bar] "导航"` 判断登录状态 (未运行/等待扫码/已登录) |
 | **控件查找** | 导航栏 / split pane / 会话列表 / 消息列表 / 输入框 |
-| **会话管理** | 列表获取 / 切换 (ChatWith) / 新消息检查 / Ctrl+F 搜索回退 |
-| **消息发送** | 切换会话 → 粘贴文本 → Enter 发送 → 数据库验证 |
+| **会话管理** | 列表获取 / 精确匹配优先切换 / 新消息检查 / Ctrl+F 搜索回退 |
+| **消息发送** | 公共方法提取 → 切换会话 → 粘贴文本 → Enter → DB 验证 |
 | **图片发送** | 优先独立窗口，回退主窗口 |
-| **独立窗口** | 弹出 (`add_listen`) / 关闭 (`remove_listen`) / 消息轮询 |
+| **独立窗口** | 弹出 (`add_listen`) / 关闭 (`remove_listen`) / 存活检测 |
 
 ### `chatwnd.rs` — 独立聊天窗口
 
@@ -153,8 +151,8 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 
 | 能力 | 说明 |
 |------|------|
-| **窗口管理** | 创建 / 存活检查 / 节点刷新 / 销毁 |
-| **消息读取** | 全量读取 / 增量读取 (`last_count` 追踪) / 标记已读 |
+| **窗口管理** | 创建 / 存活检查 / 销毁 |
+| **缓存失效重建** | 输入框/消息列表节点使用前 bbox 校验，失效自动重搜 |
 | **消息发送** | 激活窗口 → 发送文本/图片 → 验证 |
 
 ### `api.rs` — HTTP + WebSocket API
@@ -172,7 +170,6 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 | `/chat` | POST | 切换聊天目标 |
 | `/listen` | POST | 添加/查看监听目标 |
 | `/listen` | DELETE | 移除监听目标 |
-| `/listen/messages` | GET | AT-SPI 监听消息 |
 | `/ws` | GET | WebSocket 实时消息推送 |
 | `/debug/tree` | GET | AT-SPI2 控件树 (调试) |
 | `/debug/session_tree` | GET | 会话容器树 (调试) |
@@ -253,7 +250,7 @@ auto = ["文件传输助手", "好友A", "工作群"]
 
 项目内置 Yunzai-Bot v3 适配器 (`adapter/MimicWX.js`)，支持：
 
-- REST API + WebSocket 双通道通信
+- WebSocket 实时消息接收
 - 自动解析数据库消息 (文本/图片/语音/视频/表情/链接)
 - 智能消息分段发送 (文本 + 图片分离)
 - 私聊/群聊消息路由
@@ -302,8 +299,8 @@ GDB detach → 微信正常运行 → MimicWX 读取密钥 → 解密数据库
 | 语言 | **Rust** | 异步高性能，零运行时开销 |
 | 异步运行时 | **Tokio** | 全功能异步运行时 |
 | 消息检测 | **SQLCipher** + **fanotify** | 数据库解密 + WAL 实时监听 |
-| 消息检测 (备用) | **AT-SPI2** (`atspi-rs` + `zbus`) | D-Bus 无障碍接口 |
-| 输入注入 | **X11 XTEST** (`x11rb`) | 原生 X11 扩展，替代 uinput/xdotool |
+| UI 自动化 | **AT-SPI2** (`atspi-rs` + `zbus`) | D-Bus 无障碍接口控制 |
+| 输入注入 | **X11 XTEST** (`x11rb`) | 原生 X11 扩展 + Selection 剪贴板 |
 | API 服务 | **axum** | HTTP + WebSocket |
 | 序列化 | **serde** + **serde_json** | JSON 序列化/反序列化 |
 | XML 解析 | **quick-xml** | 微信消息 XML 解析 |
@@ -398,6 +395,19 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data))
 **快捷键**: `↑↓` 历史命令 · `←→` 移动光标 · `Ctrl+U` 清行 · `Ctrl+L` 清屏
 
 > 退出控制台但不停止容器: `Ctrl+P` 然后 `Ctrl+Q`
+
+---
+
+## 📋 更新日志
+
+### v0.5.0
+
+- ♻️ **移除 AT-SPI 消息读取** — 消息检测全面转向数据库通道，更稳定更高效
+- 🔧 **send_message/send_image 公共方法提取** — `check_listen_window` + `prepare_main_send` 减少代码重复
+- 🎯 **会话精确匹配优先** — `find_session` 改为精确 > starts_with > contains 优先级策略
+- 🔄 **ChatWnd 缓存自动刷新** — 输入框/消息列表节点使用前 bbox 校验，失效自动重新搜索
+- ⚡ **X11 Selection 剪贴板** — 文本粘贴改用 X11 Selection 协议，消除 xclip 进程开销
+- 🧹 **适配器清理** — 删除 AT-SPI 消息处理器死代码，简化 DB 验证日志
 
 ---
 

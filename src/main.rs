@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
     // ① 加载配置文件
     let config = load_config();
     if !config.listen.auto.is_empty() {
-        info!("📋 自动监听列表: {:?}", config.listen.auto);
+        debug!("📋 自动监听列表: {:?}", config.listen.auto);
     }
 
     // ② AT-SPI2 连接 (仍用于发送消息, 带重试)
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
                 break;
             }
             wechat::WeChatStatus::NotRunning if attempts < 30 => {
-                info!("⏳ 等待微信启动... ({}/30)", attempts + 1);
+                debug!("⏳ 等待微信启动... ({}/30)", attempts + 1);
                 if attempts % 5 == 4 {
                     wechat.try_reconnect().await;
                 }
@@ -315,7 +315,7 @@ async fn main() -> Result<()> {
                 loop {
                     interval.tick().await;
                     match refresh_db.refresh_contacts().await {
-                        Ok(n) => info!("👥 联系人定时刷新完成: {} 条", n),
+                        Ok(n) => debug!("👥 联系人定时刷新完成: {} 条", n),
                         Err(e) => warn!("⚠️ 联系人定时刷新失败: {}", e),
                     }
                 }
@@ -371,29 +371,7 @@ async fn main() -> Result<()> {
             }
         });
     } else {
-        // Fallback: AT-SPI 轮询 (无数据库密钥时)
-        let listen_wechat = wechat.clone();
-        let listen_tx = tx.clone();
-        tokio::spawn(async move {
-            info!("👂 后台监听 (AT-SPI fallback 模式)");
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-            loop {
-                interval.tick().await;
-                let msgs = listen_wechat.get_listen_messages().await;
-                for (who, new_msgs) in &msgs {
-                    for m in new_msgs {
-                        let json = serde_json::json!({
-                            "type": "listen_message",
-                            "from": who,
-                            "msg_type": m.msg_type,
-                            "sender": m.sender,
-                            "content": m.content,
-                        });
-                        let _ = listen_tx.send(json.to_string());
-                    }
-                }
-            }
-        });
+        warn!("⚠️ 数据库密钥不可用, 消息监听功能未启动");
     }
 
     // ⑩ 自动监听任务 (配置文件中的 auto listen 列表)

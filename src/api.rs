@@ -4,14 +4,12 @@
 //! - GET  /status        — 服务状态 (免认证)
 //! - GET  /contacts      — 联系人列表 (数据库)
 //! - GET  /sessions      — 会话列表 (优先数据库)
-//! - GET  /messages      — 当前聊天全部消息
-//! - GET  /messages/new  — 增量新消息 (优先数据库)
+//! - GET  /messages/new  — 增量新消息 (数据库)
 //! - POST /send          — 发送消息 (AT-SPI)
 //! - POST /chat          — 切换聊天 (AT-SPI)
 //! - POST /listen        — 添加监听 (弹出独立窗口)
 //! - DELETE /listen      — 移除监听
 //! - GET  /listen        — 监听列表
-//! - GET  /listen/messages — 所有监听窗口的新消息
 //! - GET  /debug/tree    — AT-SPI2 控件树
 //! - GET  /ws            — WebSocket 实时推送
 
@@ -29,7 +27,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::atspi::AtSpi;
 use crate::db::DbManager;
@@ -240,7 +238,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // 需要认证的路由
     let protected = Router::new()
         .route("/contacts", get(get_contacts))
-        .route("/messages", get(get_messages))
         .route("/messages/new", get(get_new_messages))
         .route("/send", post(send_message))
         .route("/send_image", post(send_image))
@@ -249,7 +246,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/listen", get(get_listen_list))
         .route("/listen", post(add_listen))
         .route("/listen", delete(remove_listen))
-        .route("/listen/messages", get(get_listen_messages))
         .route("/debug/tree", get(get_tree))
         .route("/debug/sessions", get(get_session_tree))
         .route("/ws", get(ws_handler))
@@ -352,24 +348,12 @@ async fn get_contacts(State(state): State<Arc<AppState>>) -> Result<impl IntoRes
     Ok(Json(serde_json::json!({ "contacts": contacts })))
 }
 
-async fn get_messages(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let msgs = state.wechat.get_all_messages().await;
-    Json(msgs)
-}
-
-async fn get_new_messages(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // 优先使用数据库
-    if let Some(db) = &state.db {
-        match db.get_new_messages().await {
-            Ok(msgs) => return Json(serde_json::to_value(msgs).unwrap_or_default()),
-            Err(e) => {
-                tracing::warn!("数据库消息查询失败, fallback AT-SPI: {}", e);
-            }
-        }
+async fn get_new_messages(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    let db = state.db.as_ref().ok_or_else(|| ApiError::unavailable("数据库不可用"))?;
+    match db.get_new_messages().await {
+        Ok(msgs) => Ok(Json(serde_json::to_value(msgs).unwrap_or_default())),
+        Err(e) => Err(ApiError::internal(format!("消息查询失败: {e}"))),
     }
-    // Fallback: AT-SPI
-    let msgs = state.wechat.get_new_messages().await;
-    Json(serde_json::to_value(msgs).unwrap_or_default())
 }
 
 async fn send_message(
@@ -551,26 +535,6 @@ async fn get_listen_list(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(list)
 }
 
-async fn get_listen_messages(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let msgs = state.wechat.take_pending_messages().await;
-
-    // 推送到 WebSocket
-    for (who, new_msgs) in &msgs {
-        for m in new_msgs {
-            let msg_json = serde_json::json!({
-                "type": "listen_message",
-                "from": who,
-                "msg_type": m.msg_type,
-                "sender": m.sender,
-                "content": m.content,
-            });
-            let _ = state.tx.send(msg_json.to_string());
-        }
-    }
-
-    Json(msgs)
-}
-
 async fn get_tree(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -607,7 +571,7 @@ async fn ws_handler(
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx = state.tx.subscribe();
-    info!("🔌 WebSocket 连接建立");
+    debug!("🔌 WebSocket 连接建立");
 
     let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
     ping_interval.tick().await; // 跳过首次
@@ -636,5 +600,5 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    info!("🔌 WebSocket 连接断开");
+    debug!("🔌 WebSocket 连接断开");
 }

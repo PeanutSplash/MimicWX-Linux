@@ -9,11 +9,11 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::atspi::{AtSpi, NodeRef, SearchAction};
 use crate::input::InputEngine;
-use crate::wechat::{ChatMessage, ms, parse_message_item};
+use crate::wechat::ms;
 
 // =====================================================================
 // ChatWnd — 独立聊天窗口
@@ -28,14 +28,8 @@ pub struct ChatWnd {
     pub window_node: NodeRef,
     /// 缓存的输入框节点 (DFS初始化时找到, 后续发送复用)
     edit_box_node: Option<NodeRef>,
-    /// 缓存的消息列表节点 (DFS初始化时找到, 后续监听复用)
+    /// 缓存的消息列表节点 (发送验证复用)
     msg_list_node: Option<NodeRef>,
-    /// 已读消息计数 (last_count 追踪法)
-    last_count: i32,
-    /// 是否自动保存图片
-    pub save_pic: bool,
-    /// 是否自动保存文件
-    pub save_file: bool,
 }
 
 impl ChatWnd {
@@ -50,9 +44,6 @@ impl ChatWnd {
             window_node,
             edit_box_node: None,
             msg_list_node: None,
-            last_count: 0,
-            save_pic: false,
-            save_file: false,
         }
     }
 
@@ -136,103 +127,6 @@ impl ChatWnd {
     }
 
     // =================================================================
-    // 消息读取
-    // =================================================================
-
-    /// 获取所有已加载的消息
-    pub async fn get_all_messages(&self) -> Vec<ChatMessage> {
-        // 优先使用缓存的消息列表节点
-        let msg_list = if let Some(ref cached) = self.msg_list_node {
-            cached.clone()
-        } else {
-            match self.find_message_list().await {
-                Some(l) => l,
-                None => {
-                    debug!("[ChatWnd::get_all_messages] {} 未找到消息列表", self.who);
-                    return Vec::new();
-                }
-            }
-        };
-
-        let count = self.atspi.child_count(&msg_list).await;
-        let mut messages = Vec::new();
-
-        for i in 0..count.min(100) {
-            if let Some(child) = self.atspi.child_at(&msg_list, i).await {
-                let msg = self.parse_message_item(&child, i).await;
-                messages.push(msg);
-            }
-        }
-
-        messages
-    }
-
-    /// 获取新消息 (last_count 追踪法: 只读取新增的消息)
-    pub async fn get_new_messages(&mut self) -> Vec<ChatMessage> {
-        // 获取消息列表节点
-        let msg_list = if let Some(ref cached) = self.msg_list_node {
-            cached.clone()
-        } else {
-            match self.find_message_list().await {
-                Some(l) => l,
-                None => return Vec::new(),
-            }
-        };
-
-        let count = self.atspi.child_count(&msg_list).await;
-        debug!("[ChatWnd::get_new_messages] {} count={} last_count={}", self.who, count, self.last_count);
-        if count < self.last_count {
-            // 消息列表变小了 (窗口重建/消息被清理), 重置
-            debug!("[ChatWnd::get_new_messages] {} count 减少, 重置 last_count", self.who);
-            self.last_count = count;
-            return Vec::new();
-        }
-        if count == self.last_count {
-            return Vec::new(); // 没有新消息
-        }
-
-        // 只读取 last_count..count 的新消息
-        let mut new_msgs = Vec::new();
-        for i in self.last_count..count.min(self.last_count + 50) {
-            if let Some(child) = self.atspi.child_at(&msg_list, i).await {
-                let msg = self.parse_message_item(&child, i).await;
-                new_msgs.push(msg);
-            }
-        }
-
-        self.last_count = count;
-        new_msgs
-    }
-
-    /// 标记当前所有消息为已读
-    pub async fn mark_all_read(&mut self) {
-        let msg_list = if let Some(ref cached) = self.msg_list_node {
-            cached.clone()
-        } else {
-            match self.find_message_list().await {
-                Some(l) => l,
-                None => {
-                    debug!("[ChatWnd::mark_all_read] {} 未找到消息列表", self.who);
-                    return;
-                }
-            }
-        };
-
-        let count = self.atspi.child_count(&msg_list).await;
-        self.last_count = count;
-        debug!("[ChatWnd::mark_all_read] {} 标记 {} 条消息为已读", self.who, count);
-    }
-
-    // =================================================================
-    // 消息解析 (借鉴 wxauto _split)
-    // =================================================================
-
-    /// 解析单个消息项
-    async fn parse_message_item(&self, item: &NodeRef, index: i32) -> ChatMessage {
-        parse_message_item(&self.atspi, item, index).await
-    }
-
-    // =================================================================
     // 发送消息
     // =================================================================
 
@@ -241,7 +135,7 @@ impl ChatWnd {
     /// 简化流程: 点击窗口聚焦 → 粘贴 → Enter
     /// (独立聊天窗口会自动聚焦输入框)
     pub async fn send_message(
-        &self,
+        &mut self,
         engine: &mut InputEngine,
         text: &str,
         skip_verify: bool,
@@ -251,7 +145,7 @@ impl ChatWnd {
         // 1. 激活窗口并聚焦输入框
         self.activate_and_focus_input(engine).await?;
 
-        // 2. 粘贴消息 (xclip + Ctrl+V)
+        // 2. 粘贴消息 (X11 Selection + Ctrl+V)
         engine.paste_text(text).await?;
         tokio::time::sleep(ms(300)).await;
 
@@ -277,7 +171,7 @@ impl ChatWnd {
     /// 流程: 激活窗口 → 点击输入框 → 粘贴图片 → Enter
     /// (图片不做文本验证)
     pub async fn send_image(
-        &self,
+        &mut self,
         engine: &mut InputEngine,
         image_path: &str,
     ) -> Result<(bool, bool, String)> {
@@ -299,7 +193,7 @@ impl ChatWnd {
     }
 
     /// 激活独立窗口并聚焦输入框 (send_message/send_image 的公共前置步骤)
-    async fn activate_and_focus_input(&self, engine: &mut InputEngine) -> Result<()> {
+    async fn activate_and_focus_input(&mut self, engine: &mut InputEngine) -> Result<()> {
         // 1. 将独立窗口提到前台 (X11 _NET_ACTIVE_WINDOW)
         let activated = engine.activate_window_by_title(&self.who, false)
             .unwrap_or(false);
@@ -312,9 +206,25 @@ impl ChatWnd {
         }
         tokio::time::sleep(ms(300)).await;
 
-        // 2. 点击输入框 (缓存的精确坐标, 或偏移量回退)
+        // 2. 点击输入框 (缓存的精确坐标, 失效时自动重新搜索)
+        let edit_valid = if let Some(ref edit_node) = self.edit_box_node {
+            self.atspi.bbox(edit_node).await
+                .map(|b| b.w > 0 && b.h > 0)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if !edit_valid {
+            // 缓存失效或未初始化 → 重新搜索
+            if self.edit_box_node.is_some() {
+                debug!("🔄 [ChatWnd] 输入框缓存失效, 重新搜索: {}", self.who);
+            }
+            self.edit_box_node = None;
+            self.init_edit_box().await;
+        }
+
         if let Some(ref edit_node) = self.edit_box_node {
-            // 精确方案: 用缓存节点的 bbox
             if let Some(eb) = self.atspi.bbox(edit_node).await {
                 let (cx, cy) = eb.center();
                 engine.click(cx, cy).await?;
@@ -333,12 +243,29 @@ impl ChatWnd {
     }
 
     /// 验证消息是否出现在消息列表末尾
-    async fn verify_sent(&self, text: &str) -> bool {
+    async fn verify_sent(&mut self, text: &str) -> bool {
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(ms(500)).await;
             }
-            // 优先使用缓存的消息列表节点 (与 get_new_messages 一致)
+
+            // 检查缓存的消息列表节点是否仍然有效
+            let cached_valid = if let Some(ref cached) = self.msg_list_node {
+                self.atspi.bbox(cached).await
+                    .map(|b| b.w > 0 && b.h > 0)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            if !cached_valid {
+                if self.msg_list_node.is_some() {
+                    debug!("🔄 [ChatWnd] 消息列表缓存失效, 重新搜索: {}", self.who);
+                }
+                self.msg_list_node = None;
+                self.init_msg_list().await;
+            }
+
             let msg_list = if let Some(ref cached) = self.msg_list_node {
                 cached.clone()
             } else {
