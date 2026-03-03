@@ -170,6 +170,7 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 | `/chat` | POST | 切换聊天目标 |
 | `/listen` | POST | 添加/查看监听目标 |
 | `/listen` | DELETE | 移除监听目标 |
+| `/command` | POST | 通用命令执行 (微信互通) |
 | `/ws` | GET | WebSocket 实时消息推送 |
 | `/debug/tree` | GET | AT-SPI2 控件树 (调试) |
 | `/debug/session_tree` | GET | 会话容器树 (调试) |
@@ -386,10 +387,16 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data))
 
 | 命令 | 功能 |
 |------|------|
-| `/restart` | 优雅重启 MimicWX (微信不受影响，3s 后自动恢复) |
+| `/restart` | 优雅重启程序 |
 | `/stop` | 正常关闭程序 |
 | `/status` | 显示运行时状态 |
 | `/refresh` | 手动刷新联系人缓存 |
+| `/reload` | 热重载配置文件 |
+| `/atmode` | 切换仅@模式 |
+| `/send <收件人> <内容>` | 发送消息 |
+| `/listen <名称>` | 添加监听 (自动写入 config.toml) |
+| `/unlisten <名称>` | 移除监听 (自动写入 config.toml) |
+| `/sessions` | 查看会话列表 |
 | `/help` | 显示帮助 |
 
 **快捷键**: `↑↓` 历史命令 · `←→` 移动光标 · `Ctrl+U` 清行 · `Ctrl+L` 清屏
@@ -399,6 +406,16 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data))
 ---
 
 ## 📋 更新日志
+
+### v0.5.1
+
+- 📡 **微信互通命令** — 主人可通过微信私聊 `#` 命令远程控制 Bot (复用 Yunzai 主人系统)
+- 🔄 **配置热重载** — `/reload` 命令重读 config.toml，自动 diff 监听列表并增删
+- 💾 **监听持久化** — `/listen` `/unlisten` 自动写入 config.toml，重启不丢失
+- 🎮 **控制台命令扩展** — 新增 `/send`、`/listen`、`/unlisten`、`/sessions`、`/reload`、`/atmode`
+- 🔧 **独立窗口自动恢复** — 发送消息时检测窗口失效自动重建
+- ⚡ **AT-SPI2 轮询替代固定延迟** — 会话切换、搜索、独立窗口弹出改用状态轮询
+- ⚙️ **@ 延迟可配置** — `config.toml` 新增 `[timing].at_delay_ms`，支持热更新
 
 ### v0.5.0
 

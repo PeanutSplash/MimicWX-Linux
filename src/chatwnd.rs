@@ -192,8 +192,8 @@ impl ChatWnd {
         Ok((true, false, "图片已发送 (独立窗口)".into()))
     }
 
-    /// 激活独立窗口并聚焦输入框 (send_message/send_image 的公共前置步骤)
-    async fn activate_and_focus_input(&mut self, engine: &mut InputEngine) -> Result<()> {
+    /// 激活独立窗口并聚焦输入框 (send_message/send_image/@ 的公共前置步骤)
+    pub async fn activate_and_focus_input(&mut self, engine: &mut InputEngine) -> Result<()> {
         // 1. 将独立窗口提到前台 (X11 _NET_ACTIVE_WINDOW)
         let activated = engine.activate_window_by_title(&self.who, false)
             .unwrap_or(false);

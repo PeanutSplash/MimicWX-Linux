@@ -175,6 +175,10 @@ pub struct DbMessage {
     pub chat_display_name: String,
     /// 是否为自己发送的消息
     pub is_self: bool,
+    /// 是否 @ 了自己 (基于 source 列的 atuserlist 精确匹配 wxid)
+    pub is_at_me: bool,
+    /// 被 @ 的 wxid 列表 (来自 source 列 <atuserlist>)
+    pub at_user_list: Vec<String>,
 }
 
 /// 原始消息 (同步查询返回, 后续异步填充显示名)
@@ -187,6 +191,8 @@ struct RawMsg {
     talker: String,
     chat: String,
     status: i64,
+    /// 消息元数据 XML (含 atuserlist 等)
+    source: String,
 }
 
 // =====================================================================
@@ -626,7 +632,7 @@ impl DbManager {
                         Ok(s) => s,
                         Err(e) => { warn!("⚠️ 查询 {} ({}) 失败: {}", meta.table, db_name, e); continue; }
                     };
-                    let msgs: Vec<(i64, i64, i64, String, i64, String, i64)> = match stmt
+                    let msgs: Vec<(i64, i64, i64, String, i64, String, i64, String)> = match stmt
                         .query_map([last_id], |row| {
                             let local_id: i64 = row.get(0)?;
                             let svr_id: i64 = row.get::<_, Option<i64>>(1)?.unwrap_or(0);
@@ -655,8 +661,11 @@ impl DbManager {
                             };
 
                             let status: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
+
+                            // source 列: 消息元数据 XML (含 atuserlist 等)
+                            let source = wcdb_get_text(row, 7);
                             
-                            Ok((local_id, svr_id, ts, content, msg_type, sender, status))
+                            Ok((local_id, svr_id, ts, content, msg_type, sender, status, source))
                         }) {
                         Ok(rows) => rows.filter_map(|r| match r {
                             Ok(v) => Some(v),
@@ -668,10 +677,10 @@ impl DbManager {
                     if !msgs.is_empty() {
                         let chat = resolve_chat_from_table(&meta.table, &conn, &mut name2id_cache);
                         let mut max_id = last_id;
-                        for (local_id, server_id, create_time, content, msg_type, talker, status) in msgs {
+                        for (local_id, server_id, create_time, content, msg_type, talker, status, source) in msgs {
                             all_msgs.push(RawMsg {
                                 local_id, server_id, create_time, content, msg_type,
-                                talker, chat: chat.clone(), status,
+                                talker, chat: chat.clone(), status, source,
                             });
                             if local_id > max_id { max_id = local_id; }
                         }
@@ -759,6 +768,17 @@ impl DbManager {
                 debug!("🔍 msg_type={} (base={}) raw: {}", m.msg_type, base_type, raw_preview);
             }
             let parsed = parse_msg_content(m.msg_type, &content);
+
+            // 解析 @ 列表: 从 source 列的 <atuserlist> 提取被 @ 者的 wxid
+            let at_user_list: Vec<String> = extract_xml_text(&m.source, "atuserlist")
+                .map(|s| s.split(',')
+                    .map(|w| w.trim().to_string())
+                    .filter(|w| !w.is_empty())
+                    .collect())
+                .unwrap_or_default();
+            let is_at_me = !self.self_wxid.is_empty()
+                && at_user_list.iter().any(|w| w == &self.self_wxid);
+
             result.push(DbMessage {
                 local_id: m.local_id,
                 server_id: m.server_id,
@@ -771,6 +791,8 @@ impl DbManager {
                 chat: m.chat,
                 chat_display_name: chat_display,
                 is_self,
+                is_at_me,
+                at_user_list,
             });
 
             // 自发消息广播: 通知 verify_sent 等待者
@@ -1140,12 +1162,17 @@ fn build_single_table_meta(conn: &Connection, table: &str) -> Option<TableMeta> 
     }).cloned();
     let status_sel = status_col.as_deref().unwrap_or("0");
 
+    let source_col = columns.iter().find(|c| {
+        c.eq_ignore_ascii_case("source")
+    }).cloned();
+    let source_sel = source_col.as_deref().unwrap_or("''");
+
     let select_sql = format!(
-        "SELECT {id}, {svr}, {time}, {content}, {typ}, {talker}, {status} \
+        "SELECT {id}, {svr}, {time}, {content}, {typ}, {talker}, {status}, {source} \
          FROM [{tbl}] WHERE {id} > ?1 ORDER BY {id} ASC",
         id = id_col, svr = svr_sel, time = time_sel,
         content = content_sel, typ = type_sel, talker = talker_sel,
-        status = status_sel, tbl = table,
+        status = status_sel, source = source_sel, tbl = table,
     );
 
     Some(TableMeta {

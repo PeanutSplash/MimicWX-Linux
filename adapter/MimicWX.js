@@ -31,6 +31,16 @@ Bot.adapter.push(
     ws = null
     self_id = "MimicWX"
     connected = false
+    /** 仅@模式: 群消息仅在被 @ 时触发处理，私聊始终监听 */
+    atOnlyMode = false
+
+    /** 切换仅@模式 (统一入口: 私聊命令 / 控制台 /atmode) */
+    toggleAtMode(source, replyTo) {
+      this.atOnlyMode = !this.atOnlyMode
+      const status = this.atOnlyMode ? "已开启（群消息仅响应@）" : "已关闭（响应全部消息）"
+      Bot.makeLog("mark", `仅@模式 ${status} (${source})`, this.self_id)
+      if (replyTo) this.sendText(replyTo, `✅ 仅@模式 ${status}`)
+    }
 
     /**
      * 将后端 parsed 结构转为 Yunzai 消息段 + 显示文本
@@ -212,6 +222,35 @@ Bot.adapter.push(
         const isGroup = data.chat && data.chat.includes("@chatroom")
         const user_id = data.talker || data.chat
         const group_id = isGroup ? data.chat : undefined
+
+        // 私聊 # 命令: 主人权限校验 → 转发到后端 /command
+        if (!isGroup) {
+          const text = (data.parsed?.data?.text || data.content || "").trim()
+          if (text.startsWith("#")) {
+            const cmdText = text.slice(1).trim()
+            if (!cmdText) { /* 忽略空 # */ }
+            else {
+              // 检查是否为 Yunzai 主人
+              const isMaster = cfg.masterQQ?.includes(user_id) ||
+                cfg.master?.[this.self_id]?.includes(String(user_id))
+              if (isMaster) {
+                // 映射命令名 (中文 → 英文)
+                const cmdMap = {
+                  "状态": "status", "重载": "reload", "刷新配置": "reload",
+                  "仅@模式": "atmode", "仅at模式": "atmode",
+                }
+                const mapped = cmdMap[cmdText] || cmdText
+                this.execRemoteCommand(mapped, data.talker_display || data.talker)
+              }
+              // 非主人忽略 # 命令 (不回复, 不阻止下发到 Yunzai)
+            }
+          }
+        }
+
+        // 仅@模式: 群消息过滤 (非 @ 消息跳过, 私聊始终通过)
+        if (this.atOnlyMode && isGroup && !data.is_at_me) {
+          return
+        }
         const bot = Bot[this.self_id]
 
         // 动态更新联系人/群映射 (确保 pickGroup/pickFriend 能找到正确的显示名)
@@ -229,7 +268,22 @@ Bot.adapter.push(
           }
         }
 
-        const { segments, display } = this.parseMsgContent(data.parsed, data.content)
+        let { segments, display } = this.parseMsgContent(data.parsed, data.content)
+
+        // @ 消息: 剥掉开头的 "@名字 " 前缀, 让下游插件能正确匹配命令
+        // 例: "@Bot #帮助" → "#帮助"
+        if (data.is_at_me && display.startsWith("@")) {
+          const stripped = display.replace(/^@\S+[\s\u2005\u00a0]*/, "")
+          if (stripped) {
+            display = stripped
+            // 同步更新 segments 中的文本段
+            for (const seg of segments) {
+              if (seg.type === "text" && seg.text) {
+                seg.text = seg.text.replace(/^@\S+[\s\u2005\u00a0]*/, "")
+              }
+            }
+          }
+        }
 
         const e = {
           self_id: this.self_id,
@@ -268,6 +322,38 @@ Bot.adapter.push(
       if (data.type === "sent") {
         Bot.makeLog("debug", `消息发送确认: ${data.to} verified=${data.verified}`, this.self_id)
       }
+
+      // control: 控制命令 (来自控制台 /atmode)
+      if (data.type === "control" && data.cmd === "toggle_at_mode") {
+        this.toggleAtMode("控制台")
+      }
+    }
+
+    /**
+     * 执行远程命令 (主人通过微信私聊 # 触发)
+     * @param {string} cmd - 命令字符串 (如 "status", "reload", "listen 群名")
+     * @param {string} replyTo - 回复目标 (主人显示名)
+     */
+    async execRemoteCommand(cmd, replyTo) {
+      try {
+        Bot.makeLog("info", `🎮 主人远程命令: ${cmd}`, this.self_id)
+        const res = await fetch(`${MIMICWX_URL}/command`, {
+          method: "POST",
+          headers: { ...authHeaders(), "Content-Type": "application/json" },
+          body: JSON.stringify({ cmd }),
+        })
+        if (!res.ok) {
+          this.sendText(replyTo, `⚠️ 命令执行失败: HTTP ${res.status}`)
+          return
+        }
+        const data = await res.json()
+        if (data.result) {
+          this.sendText(replyTo, data.result)
+        }
+      } catch (e) {
+        Bot.makeLog("warn", `🎮 远程命令失败: ${e.message}`, this.self_id)
+        this.sendText(replyTo, `⚠️ 命令执行异常: ${e.message}`)
+      }
     }
 
     // =========================================================
@@ -283,6 +369,7 @@ Bot.adapter.push(
 
       const textParts = []
       const imageTasks = []
+      const atList = []
 
       for (const seg of msg) {
         if (typeof seg === "string") {
@@ -294,7 +381,7 @@ Bot.adapter.push(
           // 从好友列表解析 wxid → 显示名
           const info = Bot[this.self_id]?.fl?.get(uid)
           const name = info?.nickname || info?.user_name || uid
-          textParts.push(`@${name}\u2005`)
+          atList.push(name)
         } else if (seg.type === "image") {
           // 图片段: 收集后单独发送
           const file = seg.file || seg.url || seg.data?.file || seg.data?.url
@@ -317,9 +404,11 @@ Bot.adapter.push(
         }
       }
 
-      // 先发文本
+      // 先发文本 (带 @ 列表)
       const text = textParts.join("").trim()
-      if (text) await this.sendText(to, text)
+      if (text || atList.length > 0) {
+        await this.sendText(to, text, atList)
+      }
 
       // 再发图片 (逐张)
       for (const file of imageTasks) {
@@ -327,13 +416,15 @@ Bot.adapter.push(
       }
     }
 
-    /** 发送纯文本 */
-    async sendText(to, text) {
+    /** 发送纯文本 (可带 @ 列表) */
+    async sendText(to, text, at = []) {
       try {
+        const body = { to, text }
+        if (at.length > 0) body.at = at
         const res = await fetch(`${MIMICWX_URL}/send`, {
           method: "POST",
           headers: authHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ to, text }),
+          body: JSON.stringify(body),
         })
         const result = await res.json()
         if (!result.sent) {

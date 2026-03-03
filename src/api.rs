@@ -50,6 +50,8 @@ pub struct AppState {
     pub api_token: Option<String>,
     /// 启动时间 (用于 uptime 计算)
     pub start_time: std::time::Instant,
+    /// 配置文件路径 (用于 /reload 和 /listen 持久化)
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 // =====================================================================
@@ -63,6 +65,7 @@ pub enum InputCommand {
     SendMessage {
         to: String,
         text: String,
+        at: Vec<String>,
         skip_verify: bool,
         reply: oneshot::Sender<anyhow::Result<(bool, bool, String)>>,
     },
@@ -95,11 +98,19 @@ pub fn spawn_input_actor(
         info!("🎮 InputEngine actor 已启动");
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                InputCommand::SendMessage { to, text, skip_verify, reply } => {
-                    let result = wechat.send_message(&mut engine, &to, &text, skip_verify).await;
+                InputCommand::SendMessage { to, text, at, skip_verify, reply } => {
+                    // 自动恢复: 独立窗口失效时尝试重建
+                    if !wechat.check_listen_window(&to).await {
+                        wechat.try_recover_listen_window(&mut engine, &to).await;
+                    }
+                    let result = wechat.send_message(&mut engine, &to, &text, &at, skip_verify).await;
                     let _ = reply.send(result);
                 }
                 InputCommand::SendImage { to, image_path, reply } => {
+                    // 自动恢复: 独立窗口失效时尝试重建
+                    if !wechat.check_listen_window(&to).await {
+                        wechat.try_recover_listen_window(&mut engine, &to).await;
+                    }
                     let result = wechat.send_image(&mut engine, &to, &image_path).await;
                     let _ = reply.send(result);
                 }
@@ -246,6 +257,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/listen", get(get_listen_list))
         .route("/listen", post(add_listen))
         .route("/listen", delete(remove_listen))
+        .route("/command", post(exec_command))
         .route("/debug/tree", get(get_tree))
         .route("/debug/sessions", get(get_session_tree))
         .route("/ws", get(ws_handler))
@@ -277,6 +289,9 @@ struct StatusResponse {
 struct SendRequest {
     to: String,
     text: String,
+    /// 要 @ 的人的显示名列表 (可选)
+    #[serde(default)]
+    at: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -371,6 +386,7 @@ async fn send_message(
     state.input_tx.send(InputCommand::SendMessage {
         to: req.to.clone(),
         text: req.text.clone(),
+        at: req.at.clone(),
         skip_verify: has_db,
         reply: reply_tx,
     }).await.map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
@@ -601,4 +617,203 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     debug!("🔌 WebSocket 连接断开");
+}
+
+// =====================================================================
+// POST /command — 通用命令执行 (微信互通)
+// =====================================================================
+
+#[derive(Deserialize)]
+struct CommandReq {
+    cmd: String,
+}
+
+async fn exec_command(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CommandReq>,
+) -> impl IntoResponse {
+    let cmd = req.cmd.trim();
+    info!("🎮 收到远程命令: {cmd}");
+
+    let result = match cmd {
+        "status" => {
+            let status = state.wechat.check_status().await;
+            let listen_list = state.wechat.get_listen_list().await;
+            let db_status = if state.db.is_some() { "可用" } else { "不可用" };
+            let contacts = if let Some(ref d) = state.db { d.get_contacts().await.len() } else { 0 };
+            let uptime = state.start_time.elapsed().as_secs();
+            let h = uptime / 3600;
+            let m = (uptime % 3600) / 60;
+            format!(
+                "📊 微信: {status}\n📊 数据库: {db_status} | 联系人: {contacts}\n📊 监听: {} 个 {:?}\n📊 运行: {h}h{m}m | v{}",
+                listen_list.len(), listen_list, env!("CARGO_PKG_VERSION")
+            )
+        }
+        "atmode" => {
+            let msg = serde_json::json!({
+                "type": "control",
+                "cmd": "toggle_at_mode",
+            });
+            let _ = state.tx.send(msg.to_string());
+            "📢 已发送仅@模式切换指令".to_string()
+        }
+        "reload" => {
+            exec_reload(&state).await
+        }
+        _ if cmd.starts_with("listen ") => {
+            let who = cmd.strip_prefix("listen ").unwrap().trim();
+            if who.is_empty() {
+                "❌ 用法: listen <联系人/群名>".to_string()
+            } else {
+                exec_listen(&state, who).await
+            }
+        }
+        _ if cmd.starts_with("unlisten ") => {
+            let who = cmd.strip_prefix("unlisten ").unwrap().trim();
+            if who.is_empty() {
+                "❌ 用法: unlisten <联系人/群名>".to_string()
+            } else {
+                exec_unlisten(&state, who).await
+            }
+        }
+        _ if cmd.starts_with("send ") => {
+            let rest = cmd.strip_prefix("send ").unwrap().trim();
+            if let Some((to, text)) = rest.split_once(' ') {
+                exec_send(&state, to.trim(), text.trim()).await
+            } else {
+                "❌ 用法: send <收件人> <内容>".to_string()
+            }
+        }
+        _ => format!("❓ 未知命令: {cmd}"),
+    };
+
+    info!("🎮 命令结果: {result}");
+    Json(serde_json::json!({ "ok": true, "result": result }))
+}
+
+/// 执行 reload 命令
+async fn exec_reload(state: &AppState) -> String {
+    let path = match &state.config_path {
+        Some(p) => p,
+        None => return "⚠️ 未找到配置文件路径".to_string(),
+    };
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return format!("⚠️ 读取配置失败: {e}"),
+    };
+    let new_config: crate::AppConfig = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => return format!("⚠️ 配置解析失败: {e}"),
+    };
+
+    let mut lines = Vec::new();
+
+    // 更新 at_delay_ms
+    let old = state.wechat.get_at_delay_ms();
+    let new = new_config.timing.at_delay_ms;
+    if old != new {
+        state.wechat.set_at_delay_ms(new);
+        lines.push(format!("⚙️ at_delay_ms: {old} → {new}"));
+    }
+
+    // Diff listen 列表
+    let current = state.wechat.get_listen_list().await;
+    let new_list = new_config.listen.auto;
+    let to_add: Vec<_> = new_list.iter().filter(|n| !current.contains(n)).cloned().collect();
+    let to_remove: Vec<_> = current.iter().filter(|n| !new_list.contains(n)).cloned().collect();
+
+    for who in &to_remove {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if state.input_tx.send(InputCommand::RemoveListen {
+            who: who.clone(), reply: reply_tx,
+        }).await.is_ok() {
+            let _ = reply_rx.await;
+        }
+        lines.push(format!("👂 移除监听: {who}"));
+    }
+    for who in &to_add {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if state.input_tx.send(InputCommand::AddListen {
+            who: who.clone(), reply: reply_tx,
+        }).await.is_ok() {
+            match reply_rx.await {
+                Ok(Ok(true)) => lines.push(format!("✅ 添加监听: {who}")),
+                _ => lines.push(format!("⚠️ 添加失败: {who}")),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+
+    if lines.is_empty() {
+        "⚙️ 配置已重载 (无变化)".to_string()
+    } else {
+        lines.push("⚙️ 配置已重载".to_string());
+        lines.join("\n")
+    }
+}
+
+/// 执行 listen 命令
+async fn exec_listen(state: &AppState, who: &str) -> String {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state.input_tx.send(InputCommand::AddListen {
+        who: who.to_string(), reply: reply_tx,
+    }).await.is_err() {
+        return "⚠️ InputEngine 不可用".to_string();
+    }
+    match reply_rx.await {
+        Ok(Ok(true)) => {
+            // 持久化
+            if let Some(ref path) = state.config_path {
+                let mut list = state.wechat.get_listen_list().await;
+                if !list.contains(&who.to_string()) { list.push(who.to_string()); }
+                crate::save_listen_list(path, &list);
+            }
+            format!("✅ 监听已添加: {who}")
+        }
+        Ok(Ok(false)) => format!("⚠️ 添加失败: {who}"),
+        Ok(Err(e)) => format!("⚠️ 错误: {e}"),
+        Err(_) => "⚠️ actor 响应通道已关闭".to_string(),
+    }
+}
+
+/// 执行 unlisten 命令
+async fn exec_unlisten(state: &AppState, who: &str) -> String {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state.input_tx.send(InputCommand::RemoveListen {
+        who: who.to_string(), reply: reply_tx,
+    }).await.is_err() {
+        return "⚠️ InputEngine 不可用".to_string();
+    }
+    match reply_rx.await {
+        Ok(true) => {
+            // 持久化
+            if let Some(ref path) = state.config_path {
+                let mut list = state.wechat.get_listen_list().await;
+                list.retain(|n| n != who);
+                crate::save_listen_list(path, &list);
+            }
+            format!("✅ 监听已移除: {who}")
+        }
+        Ok(false) => format!("⚠️ 未找到监听: {who}"),
+        Err(_) => "⚠️ actor 响应通道已关闭".to_string(),
+    }
+}
+
+/// 执行 send 命令
+async fn exec_send(state: &AppState, to: &str, text: &str) -> String {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let has_db = state.db.is_some();
+    if state.input_tx.send(InputCommand::SendMessage {
+        to: to.to_string(), text: text.to_string(),
+        at: vec![], skip_verify: has_db,
+        reply: reply_tx,
+    }).await.is_err() {
+        return "⚠️ InputEngine 不可用".to_string();
+    }
+    match reply_rx.await {
+        Ok(Ok((true, _, msg))) => format!("✅ {msg}"),
+        Ok(Ok((false, _, msg))) => format!("⚠️ {msg}"),
+        Ok(Err(e)) => format!("⚠️ 发送失败: {e}"),
+        Err(_) => "⚠️ actor 响应通道已关闭".to_string(),
+    }
 }
