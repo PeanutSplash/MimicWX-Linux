@@ -13,7 +13,8 @@
 - 🔑 **GDB 自动密钥提取** — 在 `setCipherKey` 偏移处设断点，扫码登录后自动从寄存器捕获 32 字节 AES 密钥
 - 💬 **独立聊天窗口** — 借鉴 [wxauto](https://github.com/cluic/wxauto) 的 ChatWnd 设计，支持多窗口并行收发 + NodeHandle 缓存自动失效重建
 - 🔌 **REST + JSON-RPC over WebSocket** — 完整 HTTP API + WebSocket 双向通信（JSON-RPC 2.0 请求/响应 + 实时事件推送），CORS 全开放，可对接 Yunzai 等机器人框架
-- 🐳 **Docker 一键部署** — 多阶段构建，默认 headless 运行（Xvfb + openbox），可选 VNC debug 模式
+- 📸 **截图 + 终端二维码** — X11 截屏微信窗口（多窗口自动拼接），登录时终端自动渲染二维码，无需 VNC 即可扫码
+- 🐳 **Docker 一键部署** — 多阶段构建，默认 headless 运行（Xvfb + openbox），`docker compose up -d` 即可完成部署和登录
 - 🔒 **Token 认证** — 支持 Bearer Token 认证保护 API 安全
 - 🖥️ **交互式控制台** — 支持 `/restart`、`/stop`、`/status`、`/refresh`、`/help` 命令，方向键切换历史
 - 💡 **自动弹性** — AT-SPI2 心跳自动重连、联系人定时刷新、优雅重启/关闭
@@ -181,6 +182,8 @@ MimicWX-Linux/
 | **图片发送** | `xclip -selection clipboard -t image/png` → `Ctrl+V` 粘贴 |
 | **鼠标** | 移动 / 单击 / 双击 / 右键 / 滚轮 |
 | **窗口管理** | X11 原生 `_NET_ACTIVE_WINDOW` 激活 / `_NET_CLOSE_WINDOW` 关闭 (替代 xdotool) |
+| **窗口截图** | X11 `GetImage` 逐窗口截取微信窗口，多窗口自动水平拼接，输出 PNG |
+| **二维码检测** | `rqrr` 灰度识别 QR → `qrcode` 终端 Unicode 半块字符渲染 (▀▄█) |
 | **可观测指标** | InputMetrics 实时跟踪队列深度、命令耗时、失败计数 |
 
 ### `db.rs` — 数据库监听
@@ -278,29 +281,34 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 ```bash
 git clone https://github.com/PigeonCoders/MimicWX-Linux.git
 cd MimicWX-Linux
+docker compose up -d
 ```
 
-**首次部署（需要扫码登录微信）：**
+**扫码登录（无需 VNC）：**
+
+服务启动后，API 会在登录前即可用。有两种方式获取登录二维码：
 
 ```bash
-# 启动 debug 模式容器（含 VNC 桌面）
+# 方式一: 查看容器日志，终端会自动渲染二维码
+docker logs -f mimicwx-linux
+
+# 方式二: 通过截图 API 获取二维码图片
+curl http://HOST:8899/screenshot -o qr.png
+# 或直接在浏览器打开 http://HOST:8899/screenshot
+```
+
+登录完成后服务自动进入 Serving 状态，后续可随时通过 `/screenshot` 查看微信运行状态。
+
+> 微信登录状态保存在 `wechat-data` volume 中，重启容器无需重新登录。
+
+**可选: VNC debug 模式**
+
+如需完整远程桌面（排查问题时），可使用 debug 模式：
+
+```bash
 docker compose --profile debug up -d mimicwx-debug
-
-# 浏览器打开 noVNC 扫码登录
-# http://HOST:6080/vnc.html (密码: mimicwx)
-
-# 扫码完成、确认服务正常后，切换为 headless 模式
-docker compose --profile debug down
-docker compose up -d
+# 浏览器打开 http://HOST:6080/vnc.html (密码: mimicwx)
 ```
-
-**后续启动（已登录，headless 模式）：**
-
-```bash
-docker compose up -d
-```
-
-> 微信登录状态保存在 `wechat-data` volume 中，debug 和 headless 容器共享，切换不丢失。
 
 ### 本地开发
 
@@ -339,6 +347,7 @@ make dev      # 容器内 cargo-watch 热编译（监听 src/ 变化自动重启
 | 服务 | 地址 | 说明 |
 |------|------|------|
 | API | `http://HOST:8899` | REST API 接口 |
+| 截图 | `http://HOST:8899/screenshot` | 微信窗口截图 (免认证，可用于扫码登录) |
 | WebSocket | `ws://HOST:8899/ws` | JSON-RPC 2.0 + 实时事件推送 |
 | noVNC | `http://HOST:6080/vnc.html` | 浏览器远程桌面 (仅 debug 模式，密码: `mimicwx`) |
 | VNC | `vnc://HOST:5901` | VNC 客户端连接 (仅 debug 模式) |
@@ -447,10 +456,11 @@ GDB detach → 微信正常运行 → MimicWX 读取密钥 → 解密数据库
       ├── Booting       → AT-SPI2 连接 + X11 XTEST 输入引擎
       ├── DesktopReady  → 等待微信进程
       ├── WeChatReady   → 检测登录状态
-      ├── LoginWaiting  → 等待扫码
+      ├── API 服务启动  → /status + /screenshot 立即可用 (登录前)
+      ├── LoginWaiting  → 终端自动渲染二维码 + /screenshot 获取二维码
       ├── KeyReady      → 读取 GDB 密钥
       ├── DbReady       → DbManager 初始化 + 联系人加载
-      ├── Serving       → API 服务 + 消息监听 + 自动监听
+      ├── Serving       → 全功能服务 + 消息监听 + 自动监听
       └── Degraded      → 部分功能降级运行
 ```
 
