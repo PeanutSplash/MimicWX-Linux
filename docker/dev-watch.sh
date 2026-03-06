@@ -11,13 +11,28 @@ cd /home/wechat/mimicwx-linux
 # 加载 Rust 环境
 export PATH="/home/wechat/.cargo/bin:$PATH"
 
-echo "================================"
-echo " MimicWX Dev Watch"
-echo " 监听 src/ 变化, 自动编译+重启"
-echo "================================"
+# 颜色定义
+RESET="\033[0m"
+BOLD="\033[1m"
+DIM="\033[2m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+CYAN="\033[36m"
+
+VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+echo ""
+echo -e "  ${BOLD}${CYAN}MIMICWX${RESET} ${GREEN}v${VERSION}${RESET}  ${DIM}dev server running${RESET}"
+echo ""
+echo -e "  ${DIM}watching${RESET}  src/"
+echo -e "  ${DIM}mode${RESET}     debug"
+echo ""
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 cargo watch \
+  --quiet \
   --poll \
   -w src \
-  -x 'build' \
-  -s 'sudo rm -f /usr/local/bin/mimicwx && sudo cp target/debug/mimicwx /usr/local/bin/mimicwx && sudo setcap cap_sys_admin+ep /usr/local/bin/mimicwx && echo ">>> 二进制已替换" && sudo pkill -x mimicwx && echo ">>> 已重启" || echo ">>> 替换完成, MimicWX 未运行"'
+  -s "bash ${SCRIPT_DIR}/dev-build.sh"
