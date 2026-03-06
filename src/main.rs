@@ -220,7 +220,150 @@ async fn main() -> Result<()> {
         config.timing.at_delay_ms,
     ));
 
-    // ⑤ 等待微信就绪
+    // ⑤ 广播通道 + InputEngine Actor (提前启动, 使 API 在登录等待阶段可用)
+    let (tx, _) = tokio::sync::broadcast::channel::<WxEvent>(128);
+
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<api::InputCommand>(32);
+    let input_metrics = Arc::new(api::InputMetrics::default());
+
+    if let Some(eng) = engine {
+        api::spawn_input_actor(eng, wechat.clone(), input_metrics.clone(), input_rx);
+    } else {
+        warn!("⚠️ X11 输入引擎不可用, InputEngine actor 未启动");
+    }
+
+    // ⑥ 创建 AppState (db 使用 OnceLock, 稍后在 DB 就绪时设置)
+    let db_lock: Arc<std::sync::OnceLock<Arc<db::DbManager>>> =
+        Arc::new(std::sync::OnceLock::new());
+
+    let state = Arc::new(api::AppState {
+        wechat: wechat.clone(),
+        atspi: atspi.clone(),
+        runtime: runtime.clone(),
+        input_metrics: input_metrics.clone(),
+        input_tx: input_tx.clone(),
+        tx: tx.clone(),
+        db: db_lock.clone(),
+        api_token: config.api.token.filter(|t| !t.is_empty()),
+        start_time: std::time::Instant::now(),
+        config_path: config_path.clone(),
+    });
+
+    // ⑦ 退出码 + 关闭信号
+    let exit_code = Arc::new(AtomicI32::new(0));
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
+    // ⑧ 启动 API 服务 (提前启动, /screenshot 和 /status 在登录等待阶段即可用)
+    let app = api::build_router(state.clone());
+    let addr = std::env::var("MIMICWX_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8899".to_string());
+    info!("🌐 API 服务启动: http://{addr}");
+    info!("📡 WebSocket: ws://{addr}/ws");
+    info!("📌 端点: /status, /screenshot, /contacts, /sessions, /messages/new, /send, /chat, /listen, /ws");
+    if state.api_token.is_some() {
+        info!("🔒 API 认证已启用 (Bearer Token)");
+    } else {
+        warn!("⚠️ API 认证未启用 (config.toml [api] token 未配置)");
+    }
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    {
+        let mut api_shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = api_shutdown_rx.recv().await;
+                    info!("🛑 API 服务正在关闭...");
+                })
+                .await
+                .ok();
+        });
+    }
+
+    // ⑨ RuntimeState 变更桥接到 WxEvent 广播
+    {
+        let mut runtime_rx = runtime.subscribe();
+        let runtime_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = runtime_rx.recv().await {
+                let _ = runtime_tx.send(WxEvent::StatusChange {
+                    from: event.from,
+                    to: event.to,
+                });
+            }
+        });
+    }
+
+    // ⑩ AT-SPI2 健康检查心跳 (每 30s 检查连接, 连续 3 次异常自动重连)
+    {
+        let hb_atspi = atspi.clone();
+        let mut hb_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut fail_count: u32 = 0;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.tick().await; // 跳过首次立即触发
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = hb_shutdown.recv() => {
+                        debug!("💓 AT-SPI2 心跳停止");
+                        break;
+                    }
+                }
+
+                if let Some(registry) = atspi::AtSpi::registry() {
+                    let count = hb_atspi.child_count(&registry).await;
+                    if count > 0 {
+                        if fail_count > 0 {
+                            info!("💓 AT-SPI2 连接恢复 ({count} 个应用)");
+                        }
+                        fail_count = 0;
+                    } else {
+                        fail_count += 1;
+                        warn!("💓 AT-SPI2 心跳异常: Registry 返回 0 个应用 (连续 {fail_count} 次)");
+                        if fail_count >= 3 {
+                            warn!("💓 连续 3 次异常, 尝试重连...");
+                            if hb_atspi.reconnect().await {
+                                fail_count = 0;
+                                info!("💓 AT-SPI2 重连成功");
+                            } else {
+                                warn!("💓 AT-SPI2 重连失败, 30s 后再试");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // ⑪ 控制台命令读取器 (stdin)
+    {
+        let console_exit = exit_code.clone();
+        let console_shutdown = shutdown_tx.clone();
+        let console_wechat = wechat.clone();
+        let console_runtime = runtime.clone();
+        let console_metrics = input_metrics.clone();
+        let console_tx = tx.clone();
+        let console_input_tx = input_tx.clone();
+        let console_config_path = config_path.clone();
+        let console_db = db_lock.clone();
+        tokio::spawn(async move {
+            console_loop(
+                console_exit,
+                console_shutdown,
+                console_runtime,
+                console_metrics,
+                console_wechat,
+                console_db,
+                console_tx,
+                console_input_tx,
+                console_config_path,
+            )
+            .await;
+        });
+    }
+
+    // ⑫ 等待微信就绪 (API 已在后台运行, /screenshot 可用于扫码)
     let mut attempts = 0;
     let mut login_prompted = false;
     let mut wechat_ready_seen = false;
@@ -260,7 +403,7 @@ async fn main() -> Result<()> {
                             "📱 请通过 noVNC (http://localhost:{novnc_port}/vnc.html) 扫码登录微信"
                         );
                     } else {
-                        info!("📱 当前为 headless 模式，如需扫码请临时用 MIMICWX_DEBUG=1 启动容器");
+                        info!("📱 请访问 http://<HOST>:8899/screenshot 查看二维码并扫码登录");
                     }
                     info!("🔑 GDB 密钥提取已在后台运行, 登录后将自动获取数据库密钥");
                     login_prompted = true;
@@ -274,7 +417,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ⑥ 读取 GDB 提取的数据库密钥 + 初始化 DbManager
+    // ⑬ 读取 GDB 提取的数据库密钥 + 初始化 DbManager
     let key_provider = GdbFileKeyProvider::new("/tmp/wechat_key.txt");
     for i in 0..10 {
         if key_provider.is_ready() {
@@ -342,115 +485,16 @@ async fn main() -> Result<()> {
         }
     };
 
-    // ⑦ 广播通道 (WebSocket)
-    let (tx, _) = tokio::sync::broadcast::channel::<WxEvent>(128);
-
-    // ⑧ InputEngine Actor + API 服务
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<api::InputCommand>(32);
-    let input_metrics = Arc::new(api::InputMetrics::default());
-
-    // Spawn actor (engine 所有权转移给 actor)
-    if let Some(eng) = engine {
-        api::spawn_input_actor(eng, wechat.clone(), input_metrics.clone(), input_rx);
-    } else {
-        warn!("⚠️ X11 输入引擎不可用, InputEngine actor 未启动");
+    // 将 DbManager 设置到 OnceLock (API 层立即可见)
+    if let Some(ref mgr) = db_manager {
+        let _ = db_lock.set(mgr.clone());
     }
 
-    let state = Arc::new(api::AppState {
-        wechat: wechat.clone(),
-        atspi: atspi.clone(),
-        runtime: runtime.clone(),
-        input_metrics: input_metrics.clone(),
-        input_tx: input_tx.clone(),
-        tx: tx.clone(),
-        db: db_manager.clone(),
-        api_token: config.api.token.filter(|t| !t.is_empty()),
-        start_time: std::time::Instant::now(),
-        config_path: config_path.clone(),
-    });
-
-    let app = api::build_router(state.clone());
-    let addr = std::env::var("MIMICWX_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8899".to_string());
-    info!("🌐 API 服务启动: http://{addr}");
-    info!("📡 WebSocket: ws://{addr}/ws");
-    info!("📌 端点: /status, /contacts, /sessions, /messages/new, /send, /chat, /listen, /ws");
-    if state.api_token.is_some() {
-        info!("🔒 API 认证已启用 (Bearer Token)");
-    } else {
-        warn!("⚠️ API 认证未启用 (config.toml [api] token 未配置)");
-    }
-
-    {
-        let mut runtime_rx = runtime.subscribe();
-        let runtime_tx = tx.clone();
-        tokio::spawn(async move {
-            while let Ok(event) = runtime_rx.recv().await {
-                let _ = runtime_tx.send(WxEvent::StatusChange {
-                    from: event.from,
-                    to: event.to,
-                });
-            }
-        });
-    }
-
-    // 退出码: 0=正常退出, 42=重启
-    let exit_code = Arc::new(AtomicI32::new(0));
-
-    // 关闭信号 (Ctrl+C 或 /restart 触发)
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-    let shutdown_tx_clone = shutdown_tx.clone();
-
-    // 保留 db_manager 引用给控制台命令使用 (db_manager 会被下面的 if let 消费)
-    let console_db_ref = db_manager.clone();
-
-    // ⑧½ AT-SPI2 健康检查心跳 (每 30s 检查连接, 连续 3 次异常自动重连)
-    {
-        let hb_atspi = atspi.clone();
-        let mut hb_shutdown = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut fail_count: u32 = 0;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            interval.tick().await; // 跳过首次立即触发
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = hb_shutdown.recv() => {
-                        debug!("💓 AT-SPI2 心跳停止");
-                        break;
-                    }
-                }
-
-                if let Some(registry) = atspi::AtSpi::registry() {
-                    let count = hb_atspi.child_count(&registry).await;
-                    if count > 0 {
-                        if fail_count > 0 {
-                            info!("💓 AT-SPI2 连接恢复 ({count} 个应用)");
-                        }
-                        fail_count = 0;
-                    } else {
-                        fail_count += 1;
-                        warn!("💓 AT-SPI2 心跳异常: Registry 返回 0 个应用 (连续 {fail_count} 次)");
-                        if fail_count >= 3 {
-                            warn!("💓 连续 3 次异常, 尝试重连...");
-                            if hb_atspi.reconnect().await {
-                                fail_count = 0;
-                                info!("💓 AT-SPI2 重连成功");
-                            } else {
-                                warn!("💓 AT-SPI2 重连失败, 30s 后再试");
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // ⑨ 后台数据库消息监听任务
+    // ⑭ 后台数据库消息监听任务
     if let Some(db) = db_manager {
         let listen_tx = tx.clone();
 
-        // ⑨-a) 联系人定时刷新 (每 5 分钟, 新好友/群不用重启就有名字)
+        // ⑭-a) 联系人定时刷新 (每 5 分钟, 新好友/群不用重启就有名字)
         {
             let refresh_db = Arc::clone(&db);
             tokio::spawn(async move {
@@ -503,7 +547,7 @@ async fn main() -> Result<()> {
         warn!("⚠️ 数据库密钥不可用, 消息监听功能未启动");
     }
 
-    // ⑩ 自动监听任务 (配置文件中的 auto listen 列表)
+    // ⑮ 自动监听任务 (配置文件中的 auto listen 列表)
     if !config.listen.auto.is_empty() {
         let auto_targets = config.listen.auto.clone();
         let auto_input_tx = input_tx.clone();
@@ -543,53 +587,21 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ⑪ 控制台命令读取器 (stdin)
-    {
-        let console_exit = exit_code.clone();
-        let console_shutdown = shutdown_tx.clone();
-        let console_wechat = wechat.clone();
-        let console_runtime = runtime.clone();
-        let console_metrics = input_metrics.clone();
-        let console_tx = tx.clone();
-        let console_input_tx = input_tx.clone();
-        let console_config_path = config_path.clone();
-        tokio::spawn(async move {
-            console_loop(
-                console_exit,
-                console_shutdown,
-                console_runtime,
-                console_metrics,
-                console_wechat,
-                console_db_ref,
-                console_tx,
-                console_input_tx,
-                console_config_path,
-            )
-            .await;
-        });
-    }
-
-    // ⑫ 启动 HTTP 服务 (带优雅退出)
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
-    // 打印控制台命令提示
+    // ⑯ 等待关闭信号 (Ctrl+C 或 /restart /stop 命令)
     info!("💡 控制台命令: /restart /stop /status /refresh /help");
 
-    // 优雅退出: 监听 shutdown 信号 + Ctrl+C
-    let mut shutdown_rx = shutdown_tx_clone.subscribe();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            // 等待 shutdown 信号或 Ctrl+C
-            tokio::select! {
-                _ = shutdown_rx.recv() => {
-                    info!("🛑 收到关闭信号, 停止 API 服务...");
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("🛑 收到 Ctrl+C, 停止服务...");
-                }
-            }
-        })
-        .await?;
+    let mut final_shutdown_rx = shutdown_tx.subscribe();
+    tokio::select! {
+        _ = final_shutdown_rx.recv() => {
+            info!("🛑 收到关闭信号...");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("🛑 收到 Ctrl+C, 停止服务...");
+        }
+    }
+
+    // 通知所有后台任务停止
+    let _ = shutdown_tx.send(());
 
     let code = exit_code.load(Ordering::Relaxed);
     if code == 42 {
@@ -722,7 +734,7 @@ async fn handle_command(
     runtime: &Arc<RuntimeManager>,
     input_metrics: &Arc<api::InputMetrics>,
     wechat: &Arc<wechat::WeChat>,
-    db: &Option<Arc<db::DbManager>>,
+    db: &std::sync::OnceLock<Arc<db::DbManager>>,
     broadcast_tx: &tokio::sync::broadcast::Sender<WxEvent>,
     input_tx: &tokio::sync::mpsc::Sender<api::InputCommand>,
     config_path: &Option<PathBuf>,
@@ -744,8 +756,8 @@ async fn handle_command(
             let runtime_snapshot = runtime.snapshot().await;
             let status = wechat.check_status().await;
             let listen_list = wechat.get_listen_list().await;
-            let db_status = if db.is_some() { "可用" } else { "不可用" };
-            let contacts = if let Some(ref d) = db {
+            let db_status = if db.get().is_some() { "可用" } else { "不可用" };
+            let contacts = if let Some(d) = db.get() {
                 d.get_contacts().await.len()
             } else {
                 0
@@ -776,7 +788,7 @@ async fn handle_command(
             false
         }
         "/refresh" => {
-            if let Some(ref d) = db {
+            if let Some(d) = db.get() {
                 info!("👥 手动刷新联系人...");
                 match d.refresh_contacts().await {
                     Ok(n) => info!("👥 刷新完成: {} 条", n),
@@ -876,7 +888,7 @@ async fn handle_command(
             false
         }
         "/sessions" => {
-            if let Some(ref d) = db {
+            if let Some(d) = db.get() {
                 match d.get_sessions().await {
                     Ok(sessions) => {
                         info!("💬 === 会话列表 ({} 个) ===", sessions.len());
@@ -907,7 +919,7 @@ async fn handle_command(
                 } else {
                     info!("📤 发送消息: [{to}] → {text}");
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                    let sent_rx = db.as_ref().map(|db| db.subscribe_sent());
+                    let sent_rx = db.get().map(|db| db.subscribe_sent());
                     if api::enqueue_input_command(
                         input_tx,
                         input_metrics,
@@ -924,7 +936,7 @@ async fn handle_command(
                     {
                         match reply_rx.await {
                             Ok(Ok((true, _, msg))) => {
-                                let verified = if let (Some(db), Some(rx)) = (db.as_ref(), sent_rx)
+                                let verified = if let (Some(db), Some(rx)) = (db.get(), sent_rx)
                                 {
                                     db.verify_sent(text, rx).await.unwrap_or(false)
                                 } else {
@@ -1049,7 +1061,7 @@ async fn console_loop(
     runtime: Arc<RuntimeManager>,
     input_metrics: Arc<api::InputMetrics>,
     wechat: Arc<wechat::WeChat>,
-    db: Option<Arc<db::DbManager>>,
+    db: Arc<std::sync::OnceLock<Arc<db::DbManager>>>,
     broadcast_tx: tokio::sync::broadcast::Sender<WxEvent>,
     input_tx: tokio::sync::mpsc::Sender<api::InputCommand>,
     config_path: Option<PathBuf>,
@@ -1289,7 +1301,7 @@ async fn console_loop_simple(
     runtime: Arc<RuntimeManager>,
     input_metrics: Arc<api::InputMetrics>,
     wechat: Arc<wechat::WeChat>,
-    db: Option<Arc<db::DbManager>>,
+    db: Arc<std::sync::OnceLock<Arc<db::DbManager>>>,
     broadcast_tx: tokio::sync::broadcast::Sender<WxEvent>,
     input_tx: tokio::sync::mpsc::Sender<api::InputCommand>,
     config_path: Option<PathBuf>,

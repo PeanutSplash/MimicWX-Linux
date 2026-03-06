@@ -228,6 +228,7 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/status` | GET | RuntimeState + InputMetrics + DB/联系人/运行时间 (免认证) |
+| `/screenshot` | GET | X11 屏幕截图 PNG (免认证, 用于扫码登录) |
 | `/contacts` | GET | 联系人列表 (数据库) |
 | `/sessions` | GET | 会话列表 (优先数据库) |
 | `/messages/new` | GET | 新消息 (数据库增量) |
@@ -258,7 +259,7 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 {"jsonrpc": "2.0", "method": "message", "params": {"chat": "...", "content": "..."}}
 ```
 
-支持方法：`status`、`send`、`send_image`、`chat`、`listen`、`unlisten`、`contacts`、`sessions`
+支持方法：`status`、`send`、`send_image`、`chat`、`listen`、`unlisten`、`contacts`、`sessions`、`screenshot`
 
 > REST API 保持 100% 向后兼容。
 
@@ -460,6 +461,15 @@ GDB detach → 微信正常运行 → MimicWX 读取密钥 → 解密数据库
 ### 查询状态
 ```bash
 curl http://localhost:8899/status
+```
+
+### 获取屏幕截图 (扫码登录)
+```bash
+# 直接在浏览器打开, 或保存为文件
+curl http://localhost:8899/screenshot -o screenshot.png
+
+# 也可直接用 <img> 标签
+# <img src="http://HOST:8899/screenshot" />
 ```
 
 ### 发送消息

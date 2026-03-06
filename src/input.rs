@@ -833,3 +833,217 @@ impl InputEngine {
         self.press_key("Return").await
     }
 }
+
+/// 截取所有微信窗口并横向拼接为 PNG
+///
+/// 主窗口排最左, 独立聊天窗口依次排列在右侧。
+/// 找不到任何微信窗口时截取整个屏幕。
+/// 独立于 InputEngine, 使用临时 X11 连接, 不阻塞输入 actor.
+pub fn capture_screenshot() -> Result<Vec<u8>> {
+    let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
+    let (conn, screen_num) = RustConnection::connect(Some(&display_env))
+        .context(format!("截屏连接 X11 失败 (DISPLAY={display_env})"))?;
+
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+    let depth = screen.root_depth;
+    let bpp = if depth >= 24 { 4usize } else { 4usize };
+
+    let wechat_wins = find_wechat_windows(&conn, root);
+
+    // 截取每个窗口的 RGB 数据 + 尺寸
+    let mut captures: Vec<(Vec<u8>, u32, u32)> = Vec::new(); // (rgb, w, h)
+
+    if wechat_wins.is_empty() {
+        // 没有微信窗口, 截整个屏幕
+        debug!("📸 未找到微信窗口, 截取整个屏幕");
+        let w = screen.width_in_pixels;
+        let h = screen.height_in_pixels;
+        let image = conn
+            .get_image(xproto::ImageFormat::Z_PIXMAP, root, 0, 0, w, h, !0)?
+            .reply()
+            .context("X11 GetImage 失败")?;
+        captures.push((bgr_to_rgb(&image.data, w as u32, h as u32, bpp), w as u32, h as u32));
+    } else {
+        for (win, name, w, h) in &wechat_wins {
+            if let Some(image) = conn
+                .get_image(xproto::ImageFormat::Z_PIXMAP, *win, 0, 0, *w, *h, !0)
+                .ok()
+                .and_then(|c| c.reply().ok())
+            {
+                debug!("📸 截取窗口: '{}' 0x{:x} {}x{}", name, win, w, h);
+                captures.push((bgr_to_rgb(&image.data, *w as u32, *h as u32, bpp), *w as u32, *h as u32));
+            } else {
+                debug!("📸 截取窗口失败: '{}'", name);
+            }
+        }
+    }
+
+    if captures.is_empty() {
+        anyhow::bail!("没有可截取的窗口");
+    }
+
+    // 横向拼接: 总宽 = sum(w), 总高 = max(h)
+    let total_w: u32 = captures.iter().map(|(_, w, _)| w).sum();
+    let total_h: u32 = captures.iter().map(|(_, _, h)| *h).max().unwrap();
+
+    let mut canvas = vec![0u8; (total_w * total_h * 3) as usize];
+    let mut x_offset: u32 = 0;
+
+    for (rgb, w, h) in &captures {
+        for y in 0..*h {
+            let src_start = (y * w * 3) as usize;
+            let src_end = src_start + (*w * 3) as usize;
+            let dst_start = ((y * total_w + x_offset) * 3) as usize;
+            if src_end <= rgb.len() {
+                canvas[dst_start..dst_start + (*w * 3) as usize]
+                    .copy_from_slice(&rgb[src_start..src_end]);
+            }
+        }
+        x_offset += w;
+    }
+
+    // 编码为 PNG
+    let mut png_buf = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_buf, total_w, total_h);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().context("PNG header 写入失败")?;
+        writer.write_image_data(&canvas).context("PNG 数据写入失败")?;
+    }
+
+    debug!(
+        "📸 截屏完成: {}x{} ({} 个窗口) depth={} → {} bytes PNG",
+        total_w, total_h, captures.len(), depth, png_buf.len()
+    );
+    Ok(png_buf)
+}
+
+/// X11 BGRx/BGRA → RGB
+fn bgr_to_rgb(data: &[u8], w: u32, h: u32, bpp: usize) -> Vec<u8> {
+    let pixel_count = (w * h) as usize;
+    let mut rgb = Vec::with_capacity(pixel_count * 3);
+    for i in 0..pixel_count {
+        let offset = i * bpp;
+        if offset + 2 < data.len() {
+            rgb.push(data[offset + 2]); // R
+            rgb.push(data[offset + 1]); // G
+            rgb.push(data[offset]);      // B
+        } else {
+            rgb.extend_from_slice(&[0, 0, 0]);
+        }
+    }
+    rgb
+}
+
+/// 查找所有微信窗口, 主窗口排第一
+/// 返回 Vec<(window_id, title, width, height)>
+fn find_wechat_windows(
+    conn: &RustConnection,
+    root: u32,
+) -> Vec<(u32, String, u16, u16)> {
+    let atoms = match intern_screenshot_atoms(conn) {
+        Some(a) => a,
+        None => return vec![],
+    };
+
+    let windows = match get_client_list(conn, root, atoms.0) {
+        Some(w) => w,
+        None => return vec![],
+    };
+
+    let mut main_win: Option<(u32, String, u16, u16)> = None;
+    let mut other_wins: Vec<(u32, String, u16, u16)> = Vec::new();
+
+    for &win in &windows {
+        let name = get_window_name(conn, win, atoms.1, atoms.2).unwrap_or_default();
+        let is_exact = name == "微信" || name == "WeChat";
+        let is_wechat = is_exact || name.contains("微信") || name.contains("WeChat");
+
+        if !is_wechat {
+            continue;
+        }
+
+        let geo = match conn.get_geometry(win).ok().and_then(|c| c.reply().ok()) {
+            Some(g) if g.width > 0 && g.height > 0 => g,
+            _ => continue,
+        };
+
+        if is_exact && main_win.is_none() {
+            main_win = Some((win, name, geo.width, geo.height));
+        } else {
+            other_wins.push((win, name, geo.width, geo.height));
+        }
+    }
+
+    let mut result = Vec::new();
+    if let Some(m) = main_win {
+        result.push(m);
+    }
+    result.extend(other_wins);
+    result
+}
+
+/// intern 截屏所需的 X11 Atom: (_NET_CLIENT_LIST, _NET_WM_NAME, UTF8_STRING)
+fn intern_screenshot_atoms(conn: &RustConnection) -> Option<(u32, u32, u32)> {
+    let a = conn.intern_atom(false, b"_NET_CLIENT_LIST").ok()?.reply().ok()?.atom;
+    let b = conn.intern_atom(false, b"_NET_WM_NAME").ok()?.reply().ok()?.atom;
+    let c = conn.intern_atom(false, b"UTF8_STRING").ok()?.reply().ok()?.atom;
+    Some((a, b, c))
+}
+
+/// 从 _NET_CLIENT_LIST 获取所有顶层窗口
+fn get_client_list(conn: &RustConnection, root: u32, atom: u32) -> Option<Vec<u32>> {
+    let reply = conn
+        .get_property(false, root, atom, u32::from(AtomEnum::WINDOW), 0, 4096)
+        .ok()?
+        .reply()
+        .ok()?;
+    if reply.format == 32 && !reply.value.is_empty() {
+        Some(
+            reply.value
+                .chunks_exact(4)
+                .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
+fn get_window_name(
+    conn: &RustConnection,
+    win: u32,
+    net_wm_name: u32,
+    utf8_string: u32,
+) -> Option<String> {
+    // 尝试 _NET_WM_NAME
+    if let Ok(reply) = conn
+        .get_property(false, win, net_wm_name, utf8_string, 0, 1024)
+        .ok()?
+        .reply()
+    {
+        if !reply.value.is_empty() {
+            return Some(String::from_utf8_lossy(&reply.value).to_string());
+        }
+    }
+    // 回退 WM_NAME
+    if let Ok(reply) = conn
+        .get_property(
+            false,
+            win,
+            u32::from(AtomEnum::WM_NAME),
+            u32::from(AtomEnum::STRING),
+            0,
+            1024,
+        )
+        .ok()?
+        .reply()
+    {
+        if !reply.value.is_empty() {
+            return Some(String::from_utf8_lossy(&reply.value).to_string());
+        }
+    }
+    None
+}

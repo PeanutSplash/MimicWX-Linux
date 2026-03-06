@@ -50,6 +50,8 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code", "xtest"] }
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 # fanotify file system monitoring (PID-aware, replaces inotify)
 fanotify-rs = "0.3"
+# PNG encoding (for X11 screenshot capture)
+png = "0.17"
 # libc: raw terminal mode (termios) for interactive console
 libc = "0.2"
 

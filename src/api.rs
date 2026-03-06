@@ -10,6 +10,7 @@
 //! - POST /listen        — 添加监听 (弹出独立窗口)
 //! - DELETE /listen      — 移除监听
 //! - GET  /listen        — 监听列表
+//! - GET  /screenshot    — X11 屏幕截图 (免认证, 用于扫码)
 //! - GET  /debug/tree    — AT-SPI2 控件树
 //! - GET  /ws            — WebSocket 实时推送
 
@@ -52,8 +53,8 @@ pub struct AppState {
     /// InputEngine 命令队列 (替代 Mutex, 消除长持锁)
     pub input_tx: tokio::sync::mpsc::Sender<InputCommand>,
     pub tx: broadcast::Sender<WxEvent>,
-    /// 数据库管理器 (密钥获取成功时可用)
-    pub db: Option<Arc<DbManager>>,
+    /// 数据库管理器 (密钥获取成功后通过 OnceLock 设置)
+    pub db: Arc<std::sync::OnceLock<Arc<DbManager>>>,
     /// API 认证 Token (None = 不启用认证)
     pub api_token: Option<String>,
     /// 启动时间 (用于 uptime 计算)
@@ -439,6 +440,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // 免认证路由
     Router::new()
         .route("/status", get(get_status))
+        .route("/screenshot", get(get_screenshot))
         .merge(protected)
         .layer(tower_http::cors::CorsLayer::permissive()) // ⑩ CORS 支持
         .with_state(state)
@@ -521,8 +523,8 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
     let runtime = state.runtime.snapshot().await;
     let input_metrics = state.input_metrics.snapshot();
     let listen_count = state.wechat.get_listen_list().await.len();
-    let db_available = state.db.is_some();
-    let contacts = if let Some(ref d) = state.db {
+    let db_available = state.db.get().is_some();
+    let contacts = if let Some(d) = state.db.get() {
         d.get_contacts().await.len()
     } else {
         0
@@ -540,12 +542,24 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
     })
 }
 
+async fn get_screenshot() -> Result<impl IntoResponse, ApiError> {
+    let png_data = tokio::task::spawn_blocking(crate::input::capture_screenshot)
+        .await
+        .map_err(|e| ApiError::internal(format!("截屏任务失败: {e}")))?
+        .map_err(|e| ApiError::internal(format!("截屏失败: {e}")))?;
+
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        png_data,
+    ))
+}
+
 async fn send_message_inner(
     state: &Arc<AppState>,
     req: SendRequest,
 ) -> Result<SendResponse, ApiError> {
-    let has_db = state.db.is_some();
-    let sent_rx = state.db.as_ref().map(|db| db.subscribe_sent());
+    let has_db = state.db.get().is_some();
+    let sent_rx = state.db.get().map(|db| db.subscribe_sent());
 
     let (reply_tx, reply_rx) = oneshot::channel();
     enqueue_input_command(
@@ -567,7 +581,7 @@ async fn send_message_inner(
             let verified = if let Some(rx) = sent_rx {
                 state
                     .db
-                    .as_ref()
+                    .get()
                     .unwrap()
                     .verify_sent(&req.text, rx)
                     .await
@@ -746,13 +760,13 @@ async fn remove_listen_inner(state: &Arc<AppState>, req: ListenRequest) -> Liste
 async fn contacts_value(state: &Arc<AppState>) -> Result<Value, ApiError> {
     let db = state
         .db
-        .as_ref()
+        .get()
         .ok_or_else(|| ApiError::unavailable("数据库不可用"))?;
     Ok(serde_json::json!({ "contacts": db.get_contacts().await }))
 }
 
 async fn sessions_value(state: &Arc<AppState>) -> Value {
-    if let Some(db) = &state.db {
+    if let Some(db) = state.db.get() {
         match db.get_sessions().await {
             Ok(sessions) => return serde_json::to_value(sessions).unwrap_or_default(),
             Err(e) => tracing::warn!("数据库会话查询失败, fallback AT-SPI: {}", e),
@@ -771,7 +785,7 @@ async fn get_new_messages(
 ) -> Result<impl IntoResponse, ApiError> {
     let db = state
         .db
-        .as_ref()
+        .get()
         .ok_or_else(|| ApiError::unavailable("数据库不可用"))?;
     match db.get_new_messages().await {
         Ok(msgs) => Ok(Json(serde_json::to_value(msgs).unwrap_or_default())),
@@ -961,6 +975,15 @@ async fn dispatch_ws_method(
                 .map_err(|e| ApiError::internal(format!("参数解析失败: {e}")))?;
             Ok(serde_json::to_value(remove_listen_inner(state, req).await).unwrap_or_default())
         }
+        "screenshot" => {
+            let png_data = tokio::task::spawn_blocking(crate::input::capture_screenshot)
+                .await
+                .map_err(|e| ApiError::internal(format!("截屏任务失败: {e}")))?
+                .map_err(|e| ApiError::internal(format!("截屏失败: {e}")))?;
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+            Ok(serde_json::json!({ "image": b64, "format": "png", "size": png_data.len() }))
+        }
         "command" => {
             let cmd = params
                 .as_ref()
@@ -1029,12 +1052,12 @@ async fn exec_command_text(state: &Arc<AppState>, cmd: &str) -> String {
             let runtime = state.runtime.snapshot().await;
             let input = state.input_metrics.snapshot();
             let listen_list = state.wechat.get_listen_list().await;
-            let db_status = if state.db.is_some() {
+            let db_status = if state.db.get().is_some() {
                 "可用"
             } else {
                 "不可用"
             };
-            let contacts = if let Some(ref d) = state.db {
+            let contacts = if let Some(d) = state.db.get() {
                 d.get_contacts().await.len()
             } else {
                 0
@@ -1248,7 +1271,7 @@ async fn exec_unlisten(state: &AppState, who: &str) -> String {
 /// 执行 send 命令
 async fn exec_send(state: &AppState, to: &str, text: &str) -> String {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let sent_rx = state.db.as_ref().map(|db| db.subscribe_sent());
+    let sent_rx = state.db.get().map(|db| db.subscribe_sent());
     if enqueue_input_command(
         &state.input_tx,
         &state.input_metrics,
@@ -1267,7 +1290,7 @@ async fn exec_send(state: &AppState, to: &str, text: &str) -> String {
     }
     match reply_rx.await {
         Ok(Ok((true, _, msg))) => {
-            let verified = if let (Some(db), Some(rx)) = (state.db.as_ref(), sent_rx) {
+            let verified = if let (Some(db), Some(rx)) = (state.db.get(), sent_rx) {
                 db.verify_sent(text, rx).await.unwrap_or(false)
             } else {
                 state.wechat.verify_sent_after_send(to, text).await
