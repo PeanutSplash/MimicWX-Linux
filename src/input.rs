@@ -937,8 +937,14 @@ fn bgr_to_rgb(data: &[u8], w: u32, h: u32, bpp: usize) -> Vec<u8> {
     rgb
 }
 
-/// 查找所有微信窗口, 主窗口排第一
+/// 查找所有微信窗口, 最大窗口 (主窗口) 排第一
 /// 返回 Vec<(window_id, title, width, height)>
+///
+/// 匹配策略:
+/// - _NET_WM_NAME 或 WM_CLASS 含 "wechat" (不区分大小写)
+/// - 包含 "WeChatAppEx" (微信内嵌浏览器)
+/// - 同进程的无名窗口 (通过 _NET_WM_PID 关联)
+/// - 过滤掉面积过小的辅助窗口 (< 50x50)
 fn find_wechat_windows(
     conn: &RustConnection,
     root: u32,
@@ -948,41 +954,84 @@ fn find_wechat_windows(
         None => return vec![],
     };
 
-    let windows = match get_client_list(conn, root, atoms.0) {
-        Some(w) => w,
-        None => return vec![],
-    };
+    let wm_class_atom = conn
+        .intern_atom(false, b"WM_CLASS")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom)
+        .unwrap_or(0);
+    let wm_pid_atom = conn
+        .intern_atom(false, b"_NET_WM_PID")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom)
+        .unwrap_or(0);
 
-    let mut main_win: Option<(u32, String, u16, u16)> = None;
-    let mut other_wins: Vec<(u32, String, u16, u16)> = Vec::new();
+    // ① _NET_CLIENT_LIST: WM 管理的客户端窗口 (有属性)
+    let client_list = get_client_list(conn, root, atoms.0).unwrap_or_default();
 
-    for &win in &windows {
+    // 从 client list 中找微信窗口, 同时收集 PID
+    let mut wechat_pids = std::collections::HashSet::new();
+    let mut wins: Vec<(u32, String, u16, u16)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for &win in &client_list {
         let name = get_window_name(conn, win, atoms.1, atoms.2).unwrap_or_default();
-        let is_exact = name == "微信" || name == "WeChat";
-        let is_wechat = is_exact || name.contains("微信") || name.contains("WeChat");
+        let class = get_wm_class(conn, win, wm_class_atom).unwrap_or_default();
 
-        if !is_wechat {
+        if !is_wechat_name(&name) && !is_wechat_name(&class) {
             continue;
         }
 
+        if let Some(pid) = get_window_pid(conn, win, wm_pid_atom) {
+            wechat_pids.insert(pid);
+        }
+
         let geo = match conn.get_geometry(win).ok().and_then(|c| c.reply().ok()) {
-            Some(g) if g.width > 0 && g.height > 0 => g,
+            Some(g) if g.width >= 50 && g.height >= 50 => g,
             _ => continue,
         };
 
-        if is_exact && main_win.is_none() {
-            main_win = Some((win, name, geo.width, geo.height));
-        } else {
-            other_wins.push((win, name, geo.width, geo.height));
+        let label = if !name.is_empty() { name } else { class };
+        wins.push((win, label, geo.width, geo.height));
+        seen.insert(win);
+    }
+
+    // ② query_tree: 补充无名/未注册的窗口 (通过同 PID 关联)
+    if !wechat_pids.is_empty() {
+        if let Some(tree) = conn.query_tree(root).ok().and_then(|c| c.reply().ok()) {
+            for &win in &tree.children {
+                if seen.contains(&win) {
+                    continue;
+                }
+                let pid = get_window_pid(conn, win, wm_pid_atom);
+                if !pid.map(|p| wechat_pids.contains(&p)).unwrap_or(false) {
+                    continue;
+                }
+                let geo = match conn.get_geometry(win).ok().and_then(|c| c.reply().ok()) {
+                    Some(g) if g.width >= 50 && g.height >= 50 => g,
+                    _ => continue,
+                };
+                let name = get_window_name(conn, win, atoms.1, atoms.2)
+                    .unwrap_or_else(|| format!("0x{:x}", win));
+                wins.push((win, name, geo.width, geo.height));
+            }
         }
     }
 
-    let mut result = Vec::new();
-    if let Some(m) = main_win {
-        result.push(m);
-    }
-    result.extend(other_wins);
-    result
+    // 按面积降序排列, 最大窗口 (主窗口) 在前
+    wins.sort_by(|a, b| {
+        let area_a = (a.2 as u32) * (a.3 as u32);
+        let area_b = (b.2 as u32) * (b.3 as u32);
+        area_b.cmp(&area_a)
+    });
+
+    wins
+}
+
+fn is_wechat_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("wechat") || name.contains("微信")
 }
 
 /// intern 截屏所需的 X11 Atom: (_NET_CLIENT_LIST, _NET_WM_NAME, UTF8_STRING)
@@ -1007,6 +1056,41 @@ fn get_client_list(conn: &RustConnection, root: u32, atom: u32) -> Option<Vec<u3
                 .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         )
+    } else {
+        None
+    }
+}
+
+/// 获取 WM_CLASS (格式: "instance\0class")
+fn get_wm_class(conn: &RustConnection, win: u32, wm_class_atom: u32) -> Option<String> {
+    if wm_class_atom == 0 {
+        return None;
+    }
+    let reply = conn
+        .get_property(false, win, wm_class_atom, u32::from(AtomEnum::STRING), 0, 256)
+        .ok()?
+        .reply()
+        .ok()?;
+    if reply.value.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&reply.value).replace('\0', " ").trim().to_string())
+}
+
+/// 获取 _NET_WM_PID
+fn get_window_pid(conn: &RustConnection, win: u32, pid_atom: u32) -> Option<u32> {
+    if pid_atom == 0 {
+        return None;
+    }
+    let reply = conn
+        .get_property(false, win, pid_atom, u32::from(AtomEnum::CARDINAL), 0, 1)
+        .ok()?
+        .reply()
+        .ok()?;
+    if reply.format == 32 && reply.value.len() >= 4 {
+        Some(u32::from_ne_bytes([
+            reply.value[0], reply.value[1], reply.value[2], reply.value[3],
+        ]))
     } else {
         None
     }
