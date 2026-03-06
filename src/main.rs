@@ -367,10 +367,16 @@ async fn main() -> Result<()> {
     let mut attempts = 0;
     let mut login_prompted = false;
     let mut wechat_ready_seen = false;
+    let mut last_qr_content: Option<String> = None;
+    let mut qr_lines_printed: usize = 0;
     loop {
         let status = wechat.check_status().await;
         match status {
             wechat::WeChatStatus::LoggedIn => {
+                // 清除终端上的二维码
+                if qr_lines_printed > 0 {
+                    clear_terminal_lines(qr_lines_printed);
+                }
                 if !runtime.is_degraded().await {
                     runtime.transition_to(RuntimeState::WeChatReady).await;
                 }
@@ -396,18 +402,34 @@ async fn main() -> Result<()> {
                     runtime.transition_to(RuntimeState::LoginWaiting).await;
                 }
                 if !login_prompted {
-                    if std::env::var("MIMICWX_DEBUG").ok().as_deref() == Some("1") {
-                        let novnc_port =
-                            std::env::var("MIMICWX_NOVNC_PORT").unwrap_or_else(|_| "6080".into());
-                        info!(
-                            "📱 请通过 noVNC (http://localhost:{novnc_port}/vnc.html) 扫码登录微信"
-                        );
-                    } else {
-                        info!("📱 请访问 http://<HOST>:8899/screenshot 查看二维码并扫码登录");
-                    }
+                    info!("📱 等待扫码登录... (终端二维码 + http://<HOST>:8899/screenshot)");
                     info!("🔑 GDB 密钥提取已在后台运行, 登录后将自动获取数据库密钥");
                     login_prompted = true;
                 }
+
+                // 尝试从截屏中检测二维码并打印到终端
+                if let Some(qr_content) = tokio::task::spawn_blocking(
+                    input::detect_qr_from_screenshot,
+                )
+                .await
+                .ok()
+                .flatten()
+                {
+                    if last_qr_content.as_ref() != Some(&qr_content) {
+                        // 二维码内容变化, 清除旧的并打印新的
+                        if qr_lines_printed > 0 {
+                            clear_terminal_lines(qr_lines_printed);
+                        }
+                        if let Some((rendered, lines)) =
+                            input::render_qr_to_terminal(&qr_content)
+                        {
+                            eprintln!("\n{rendered}\n  📱 请用微信扫描上方二维码登录\n");
+                            qr_lines_printed = lines + 3; // +3: 空行 + 二维码 + 提示行
+                        }
+                        last_qr_content = Some(qr_content);
+                    }
+                }
+
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
             wechat::WeChatStatus::NotRunning => {
@@ -672,6 +694,16 @@ fn find_db_dir() -> Option<PathBuf> {
     }
 
     None
+}
+
+/// 清除终端上方 n 行 (ANSI escape: 上移 + 清行)
+fn clear_terminal_lines(n: usize) {
+    use std::io::Write;
+    let mut out = std::io::stderr();
+    for _ in 0..n {
+        let _ = write!(out, "\x1b[A\x1b[2K");
+    }
+    let _ = out.flush();
 }
 
 fn dirs_or_home() -> PathBuf {

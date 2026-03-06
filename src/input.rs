@@ -1047,3 +1047,116 @@ fn get_window_name(
     }
     None
 }
+
+// =====================================================================
+// QR 码检测 + 终端渲染
+// =====================================================================
+
+/// 从微信窗口截屏中检测二维码, 返回二维码内容字符串
+pub fn detect_qr_from_screenshot() -> Option<String> {
+    let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
+    let (conn, screen_num) = RustConnection::connect(Some(&display_env)).ok()?;
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+
+    // 只截主窗口 (二维码在主窗口上)
+    let wins = find_wechat_windows(&conn, root);
+    let (win, w, h) = if let Some((id, _, w, h)) = wins.first() {
+        (*id, *w, *h)
+    } else {
+        (root, screen.width_in_pixels, screen.height_in_pixels)
+    };
+
+    let image = conn
+        .get_image(xproto::ImageFormat::Z_PIXMAP, win, 0, 0, w, h, !0)
+        .ok()?
+        .reply()
+        .ok()?;
+
+    let bpp = 4usize;
+    let pixel_count = (w as usize) * (h as usize);
+
+    // BGR(A) → grayscale
+    let mut gray = Vec::with_capacity(pixel_count);
+    for i in 0..pixel_count {
+        let offset = i * bpp;
+        if offset + 2 < image.data.len() {
+            let b = image.data[offset] as u32;
+            let g = image.data[offset + 1] as u32;
+            let r = image.data[offset + 2] as u32;
+            gray.push(((r * 299 + g * 587 + b * 114) / 1000) as u8);
+        } else {
+            gray.push(0);
+        }
+    }
+
+    // rqrr 检测
+    let mut img = rqrr::PreparedImage::prepare_from_greyscale(w as usize, h as usize, |x, y| {
+        gray[y * (w as usize) + x]
+    });
+    let grids = img.detect_grids();
+    for grid in grids {
+        if let Ok((_meta, content)) = grid.decode() {
+            return Some(content);
+        }
+    }
+    None
+}
+
+/// 将二维码内容渲染为终端字符串 (Unicode half-block)
+/// 返回 (渲染后的字符串, 行数)
+pub fn render_qr_to_terminal(content: &str) -> Option<(String, usize)> {
+    use qrcode::QrCode;
+
+    let code = QrCode::new(content.as_bytes()).ok()?;
+    let modules = code.to_colors();
+    let width = code.width();
+
+    // 使用 Unicode half-block 渲染, 每个字符表示上下两个模块
+    // 终端通常深色背景, 所以: 黑模块=背景色, 白模块=前景色
+    // ▀ = 上半块, ▄ = 下半块, █ = 全块, ' ' = 空
+    let mut lines: Vec<String> = Vec::new();
+
+    // 加 2 格白色 quiet zone
+    let qz = 2;
+    let total_w = width + qz * 2;
+
+    // 顶部 quiet zone (1行 = 2行模块)
+    lines.push(format!("  {}", "█".repeat(total_w)));
+
+    let rows: Vec<&[qrcode::Color]> = modules.chunks(width).collect();
+    let mut y = 0;
+    while y < rows.len() {
+        let mut line = String::from("  ");
+        // 左 quiet zone
+        for _ in 0..qz {
+            line.push('█');
+        }
+        for x in 0..width {
+            let top = rows[y][x];
+            let bottom = if y + 1 < rows.len() {
+                rows[y + 1][x]
+            } else {
+                qrcode::Color::Light
+            };
+            match (top, bottom) {
+                (qrcode::Color::Dark, qrcode::Color::Dark) => line.push(' '),
+                (qrcode::Color::Dark, qrcode::Color::Light) => line.push('▄'),
+                (qrcode::Color::Light, qrcode::Color::Dark) => line.push('▀'),
+                (qrcode::Color::Light, qrcode::Color::Light) => line.push('█'),
+            }
+        }
+        // 右 quiet zone
+        for _ in 0..qz {
+            line.push('█');
+        }
+        lines.push(line);
+        y += 2;
+    }
+
+    // 底部 quiet zone
+    lines.push(format!("  {}", "█".repeat(total_w)));
+
+    let line_count = lines.len();
+    Some((lines.join("\n"), line_count))
+}

@@ -52,6 +52,9 @@ rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"]
 fanotify-rs = "0.3"
 # PNG encoding (for X11 screenshot capture)
 png = "0.17"
+# QR code detection from screenshot + terminal rendering
+rqrr = "0.8"
+qrcode = "0.14"
 # libc: raw terminal mode (termios) for interactive console
 libc = "0.2"
 
