@@ -14,8 +14,9 @@ start:
 stop:
 	docker compose down
 
-# 热更新开发模式
+# 热更新开发模式（自动确保容器运行）
 dev:
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 	docker exec -u wechat -it $(CONTAINER) bash /home/wechat/mimicwx-linux/docker/dev-watch.sh
 
 # 容器内手动编译一次
