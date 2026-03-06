@@ -90,6 +90,7 @@ pub struct ActorPort {
 }
 
 impl ActorPort {
+    #[allow(dead_code)]
     pub fn new(tx: mpsc::Sender<InputCommand>) -> Self {
         Self { tx }
     }
