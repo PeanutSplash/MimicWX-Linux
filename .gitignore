@@ -10,6 +10,9 @@ output.log
 *.swp
 *.swo
 
+# Local config
+Makefile.local
+
 # OS
 .DS_Store
 Thumbs.db

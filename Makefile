@@ -1,5 +1,7 @@
 CONTAINER = mimicwx-linux
 
+-include Makefile.local
+
 # 首次构建并启动
 up:
 	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
