@@ -194,6 +194,12 @@ while true; do
     echo "[start.sh] 🔄 重新启动 MimicWX..."
     continue
   fi
+  # 被信号 kill (热更新) → 也重启
+  if [ "$EXIT_CODE" -gt 128 ] 2>/dev/null; then
+    echo "[start.sh] 🔄 MimicWX 被信号终止 (code=$EXIT_CODE), 3秒后重启..."
+    sleep 3
+    continue
+  fi
   echo "[start.sh] MimicWX 已退出 (code=$EXIT_CODE)"
   break
 done

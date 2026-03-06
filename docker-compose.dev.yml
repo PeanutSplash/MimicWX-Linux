@@ -1,0 +1,22 @@
+# 开发模式 overlay
+# 用法: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# 源码挂载 + Rust 工具链, 支持容器内 cargo-watch 热编译
+
+services:
+  mimicwx:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - wechat-data:/home/wechat/.xwechat
+      - .:/home/wechat/mimicwx-linux
+      - cargo-registry:/home/wechat/.cargo/registry
+      - cargo-git:/home/wechat/.cargo/git
+      - cargo-target:/home/wechat/mimicwx-linux/target
+
+volumes:
+  wechat-data:
+  cargo-registry:
+  cargo-git:
+  cargo-target:
