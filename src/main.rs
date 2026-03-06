@@ -244,7 +244,25 @@ async fn main() -> Result<()> {
         input_tx: input_tx.clone(),
         tx: tx.clone(),
         db: db_lock.clone(),
-        api_token: config.api.token.filter(|t| !t.is_empty()),
+        api_token: {
+            let t = config.api.token.filter(|t| !t.is_empty());
+            if t.is_some() {
+                t
+            } else {
+                let seed = format!(
+                    "{}-{}-{:?}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos(),
+                    std::thread::current().id(),
+                );
+                let token = format!("{:x}", md5::compute(&seed));
+                warn!("🔑 未配置 Token, 已自动生成: {token}");
+                Some(token)
+            }
+        },
         start_time: std::time::Instant::now(),
         config_path: config_path.clone(),
     });
@@ -259,11 +277,7 @@ async fn main() -> Result<()> {
     info!("🌐 API 服务启动: http://{addr}");
     info!("📡 WebSocket: ws://{addr}/ws");
     info!("📌 端点: /status, /screenshot, /contacts, /sessions, /messages/new, /send, /chat, /listen, /ws");
-    if state.api_token.is_some() {
-        info!("🔒 API 认证已启用 (Bearer Token)");
-    } else {
-        warn!("⚠️ API 认证未启用 (config.toml [api] token 未配置)");
-    }
+    info!("🔒 API 认证已启用 (Bearer Token)");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     {
