@@ -72,11 +72,20 @@ fi
 # ============================================================
 # 1-8) 用户空间服务 (wechat 用户)
 # ============================================================
+# 将容器环境变量写入文件 (su - 会清除环境变量)
+printf 'export MIMICWX_DEBUG="%s"\nexport MIMICWX_DISPLAY_NUM="%s"\nexport MIMICWX_DISPLAY="%s"\nexport MIMICWX_VNC_PORT="%s"\nexport MIMICWX_NOVNC_PORT="%s"\n' \
+  "$MIMICWX_DEBUG" "$MIMICWX_DISPLAY_NUM" "$MIMICWX_DISPLAY" "$MIMICWX_VNC_PORT" "$MIMICWX_NOVNC_PORT" \
+  > /tmp/mimicwx_env.sh
+chmod 644 /tmp/mimicwx_env.sh
+
 su - wechat << 'USEREOF'
   set +e  # 确保单个命令失败不会终止整个 heredoc
   export LANG=zh_CN.UTF-8
   export LANGUAGE=zh_CN:zh
   export LC_ALL=zh_CN.UTF-8
+
+  # 从文件恢复容器环境变量
+  source /tmp/mimicwx_env.sh
 
   # 1) D-Bus session
   eval $(dbus-launch --sh-syntax)
@@ -162,7 +171,14 @@ su - wechat << 'USEREOF'
   echo "export QT_ACCESSIBILITY=1" >> ~/.dbus_env
   [ -n "$AT_SPI_BUS_ADDRESS" ] && echo "export AT_SPI_BUS_ADDRESS=$AT_SPI_BUS_ADDRESS" >> ~/.dbus_env
 
-  # 6) 启动微信 (写 PID 供 GDB 使用, 保留 stderr 日志)
+  # 6) noVNC (仅 debug, 在微信启动前启动, 方便扫码)
+  if [ "$MIMICWX_DEBUG" = "1" ]; then
+    echo "[start.sh] 启动 noVNC..."
+    websockify --web /usr/share/novnc "$NOVNC_PORT" "localhost:$VNC_PORT" &
+    echo "[start.sh] ✅ noVNC 已启动 (http://localhost:${NOVNC_PORT}/vnc.html)"
+  fi
+
+  # 7) 启动微信 (写 PID 供 GDB 使用, 保留 stderr 日志)
   echo "[start.sh] 启动微信..."
   wechat --no-sandbox --disable-gpu > /tmp/wechat_stdout.log 2>&1 &
   WECHAT_PID=$!
@@ -188,12 +204,8 @@ su - wechat << 'USEREOF'
     cat /tmp/wechat_stdout.log 2>/dev/null | tail -20
   fi
 
-  # 7) noVNC (仅 debug)
-  if [ "$MIMICWX_DEBUG" = "1" ]; then
-    echo "[start.sh] 启动 noVNC..."
-    websockify --web /usr/share/novnc "$NOVNC_PORT" "localhost:$VNC_PORT" &
-    echo "[start.sh] ✅ noVNC 已启动 (http://localhost:${NOVNC_PORT}/vnc.html)"
-  else
+  # headless 模式提示
+  if [ "$MIMICWX_DEBUG" != "1" ]; then
     echo "[start.sh] headless 模式: 未启动 VNC/noVNC"
   fi
 
@@ -212,6 +224,15 @@ else
 fi
 echo "API:   http://${MIMICWX_BIND_ADDR:-0.0.0.0:8899}"
 echo "=============================="
+
+# 等待二进制就绪 (dev 模式下需要先 make build)
+if [ ! -f /usr/local/bin/mimicwx ]; then
+  echo "[start.sh] ⏳ mimicwx 二进制未找到, 等待编译... (运行 make build 或 make dev)"
+  while [ ! -f /usr/local/bin/mimicwx ]; do
+    sleep 3
+  done
+  echo "[start.sh] ✅ mimicwx 二进制已就绪"
+fi
 
 # 重启循环: 退出码 42 = 重启请求
 while true; do

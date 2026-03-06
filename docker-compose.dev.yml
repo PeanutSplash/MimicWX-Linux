@@ -8,6 +8,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dev
+    environment:
+      MIMICWX_DEBUG: "1"
+    ports:
+      - "${MIMICWX_API_PORT:-8899}:8899"
+      - "${MIMICWX_VNC_PORT:-5901}:5901"
+      - "${MIMICWX_NOVNC_PORT:-6080}:6080"
     volumes:
       - wechat-data:/home/wechat/.xwechat
       - .:/home/wechat/mimicwx-linux
