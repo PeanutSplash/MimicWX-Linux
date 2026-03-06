@@ -42,7 +42,7 @@ ENV PATH="/root/.cargo/bin:$PATH"
 # Cargo 镜像 (国内用 rsproxy sparse index)
 RUN if [ "$USE_MIRROR" = "1" ]; then \
     mkdir -p /root/.cargo && \
-    printf '[source.crates-io]\nreplace-with = "ustc"\n[source.ustc]\nregistry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"\n' \
+    printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/crates.io-index/"\n[registries.rsproxy]\nindex = "https://rsproxy.cn/crates.io-index"\n[net]\ngit-fetch-with-cli = true\n' \
     > /root/.cargo/config.toml; \
     fi
 
