@@ -12,10 +12,17 @@ mod api;
 mod atspi;
 mod chatwnd;
 mod db;
+mod events;
 mod input;
+mod node_handle;
+mod ports;
+mod runtime;
 mod wechat;
 
 use anyhow::Result;
+use events::WxEvent;
+use ports::{GdbFileKeyProvider, KeyProvider};
+use runtime::{RuntimeManager, RuntimeState};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -166,6 +173,8 @@ async fn main() -> Result<()> {
 
     info!("🚀 MimicWX-Linux v{} 启动中...", env!("CARGO_PKG_VERSION"));
 
+    let runtime = Arc::new(RuntimeManager::new(RuntimeState::Booting));
+
     // ① 加载配置文件
     let (config, config_path) = load_config();
     if !config.listen.auto.is_empty() {
@@ -197,6 +206,13 @@ async fn main() -> Result<()> {
             None
         }
     };
+    if engine.is_some() {
+        runtime.transition_to(RuntimeState::DesktopReady).await;
+    } else {
+        runtime
+            .degrade("X11 输入引擎不可用，发送消息功能受限")
+            .await;
+    }
 
     // ④ WeChat 实例化 (AT-SPI 部分, 用于发送)
     let wechat = Arc::new(wechat::WeChat::new(
@@ -207,10 +223,14 @@ async fn main() -> Result<()> {
     // ⑤ 等待微信就绪
     let mut attempts = 0;
     let mut login_prompted = false;
+    let mut wechat_ready_seen = false;
     loop {
         let status = wechat.check_status().await;
         match status {
             wechat::WeChatStatus::LoggedIn => {
+                if !runtime.is_degraded().await {
+                    runtime.transition_to(RuntimeState::WeChatReady).await;
+                }
                 info!("✅ 微信已登录");
                 break;
             }
@@ -223,23 +243,44 @@ async fn main() -> Result<()> {
                 attempts += 1;
             }
             wechat::WeChatStatus::WaitingForLogin => {
+                if !wechat_ready_seen {
+                    wechat_ready_seen = true;
+                    if !runtime.is_degraded().await {
+                        runtime.transition_to(RuntimeState::WeChatReady).await;
+                    }
+                }
+                if !runtime.is_degraded().await {
+                    runtime.transition_to(RuntimeState::LoginWaiting).await;
+                }
                 if !login_prompted {
-                    info!("📱 请通过 noVNC (http://localhost:6080/vnc.html) 扫码登录微信");
+                    if std::env::var("MIMICWX_DEBUG").ok().as_deref() == Some("1") {
+                        let novnc_port =
+                            std::env::var("MIMICWX_NOVNC_PORT").unwrap_or_else(|_| "6080".into());
+                        info!(
+                            "📱 请通过 noVNC (http://localhost:{novnc_port}/vnc.html) 扫码登录微信"
+                        );
+                    } else {
+                        info!("📱 当前为 headless 模式，如需扫码请临时用 MIMICWX_DEBUG=1 启动容器");
+                    }
                     info!("🔑 GDB 密钥提取已在后台运行, 登录后将自动获取数据库密钥");
                     login_prompted = true;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
-            _ => {
+            wechat::WeChatStatus::NotRunning => {
+                runtime.degrade("微信未在预期时间内启动或窗口未就绪").await;
                 break;
             }
         }
     }
 
     // ⑥ 读取 GDB 提取的数据库密钥 + 初始化 DbManager
-    let key_path = "/tmp/wechat_key.txt";
+    let key_provider = GdbFileKeyProvider::new("/tmp/wechat_key.txt");
     for i in 0..10 {
-        if std::path::Path::new(key_path).exists() {
+        if key_provider.is_ready() {
+            if !runtime.is_degraded().await {
+                runtime.transition_to(RuntimeState::KeyReady).await;
+            }
             break;
         }
         if i == 0 {
@@ -248,61 +289,69 @@ async fn main() -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 
-    let db_manager: Option<Arc<db::DbManager>> = match std::fs::read_to_string(key_path) {
+    let db_manager: Option<Arc<db::DbManager>> = match key_provider.get_key().await {
         Ok(key) => {
-            let key = key.trim().to_string();
-            if key.len() == 64 {
-                info!("🔑 数据库密钥已获取 ({}...{})", &key[..8], &key[56..]);
+            info!("🔑 数据库密钥已获取 ({}...{})", &key[..8], &key[56..]);
 
-                // 查找数据库目录
-                let db_dir = find_db_dir();
-                match db_dir {
-                    Some(dir) => {
-                        match db::DbManager::new(key, dir) {
-                            Ok(mgr) => {
-                                let mgr = Arc::new(mgr);
-                                // 等待微信同步数据库后再加载联系人 (刚登录时表不完整)
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                if let Err(e) = mgr.refresh_contacts().await {
-                                    warn!("⚠️ 联系人加载失败 (可能尚无数据): {}", e);
-                                }
-                                // 标记已有消息为已读
-                                if let Err(e) = mgr.mark_all_read().await {
-                                    warn!("⚠️ 标记已读失败: {}", e);
-                                }
-                                Some(mgr)
-                            }
-                            Err(e) => {
-                                warn!("⚠️ DbManager 初始化失败: {}", e);
-                                None
-                            }
+            // 查找数据库目录
+            let db_dir = find_db_dir();
+            match db_dir {
+                Some(dir) => match db::DbManager::new(key, dir) {
+                    Ok(mgr) => {
+                        let mgr = Arc::new(mgr);
+                        if !runtime.is_degraded().await {
+                            runtime.transition_to(RuntimeState::DbReady).await;
                         }
+                        // 等待微信同步数据库后再加载联系人 (刚登录时表不完整)
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        if let Err(e) = mgr.refresh_contacts().await {
+                            warn!("⚠️ 联系人加载失败 (可能尚无数据): {}", e);
+                        }
+                        // 标记已有消息为已读
+                        if let Err(e) = mgr.mark_all_read().await {
+                            warn!("⚠️ 标记已读失败: {}", e);
+                        }
+                        if !runtime.is_degraded().await {
+                            runtime.transition_to(RuntimeState::Serving).await;
+                        }
+                        Some(mgr)
                     }
-                    None => {
-                        warn!("⚠️ 未找到微信数据库目录, 数据库监听不可用");
+                    Err(e) => {
+                        warn!("⚠️ DbManager 初始化失败: {}", e);
+                        if !runtime.is_degraded().await {
+                            runtime.degrade(format!("DbManager 初始化失败: {e}")).await;
+                        }
                         None
                     }
+                },
+                None => {
+                    warn!("⚠️ 未找到微信数据库目录, 数据库监听不可用");
+                    if !runtime.is_degraded().await {
+                        runtime.degrade("未找到微信数据库目录").await;
+                    }
+                    None
                 }
-            } else {
-                warn!("⚠️ 密钥文件格式异常 (长度: {}), 跳过", key.len());
-                None
             }
         }
-        Err(_) => {
-            warn!("⚠️ 未找到密钥文件, 数据库解密功能不可用");
+        Err(e) => {
+            warn!("⚠️ 数据库密钥不可用: {}", e);
+            if !runtime.is_degraded().await {
+                runtime.degrade(format!("数据库密钥不可用: {e}")).await;
+            }
             None
         }
     };
 
     // ⑦ 广播通道 (WebSocket)
-    let (tx, _) = tokio::sync::broadcast::channel::<String>(128);
+    let (tx, _) = tokio::sync::broadcast::channel::<WxEvent>(128);
 
     // ⑧ InputEngine Actor + API 服务
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<api::InputCommand>(32);
+    let input_metrics = Arc::new(api::InputMetrics::default());
 
     // Spawn actor (engine 所有权转移给 actor)
     if let Some(eng) = engine {
-        api::spawn_input_actor(eng, wechat.clone(), input_rx);
+        api::spawn_input_actor(eng, wechat.clone(), input_metrics.clone(), input_rx);
     } else {
         warn!("⚠️ X11 输入引擎不可用, InputEngine actor 未启动");
     }
@@ -310,6 +359,8 @@ async fn main() -> Result<()> {
     let state = Arc::new(api::AppState {
         wechat: wechat.clone(),
         atspi: atspi.clone(),
+        runtime: runtime.clone(),
+        input_metrics: input_metrics.clone(),
         input_tx: input_tx.clone(),
         tx: tx.clone(),
         db: db_manager.clone(),
@@ -319,7 +370,7 @@ async fn main() -> Result<()> {
     });
 
     let app = api::build_router(state.clone());
-    let addr = "0.0.0.0:8899";
+    let addr = std::env::var("MIMICWX_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8899".to_string());
     info!("🌐 API 服务启动: http://{addr}");
     info!("📡 WebSocket: ws://{addr}/ws");
     info!("📌 端点: /status, /contacts, /sessions, /messages/new, /send, /chat, /listen, /ws");
@@ -327,6 +378,19 @@ async fn main() -> Result<()> {
         info!("🔒 API 认证已启用 (Bearer Token)");
     } else {
         warn!("⚠️ API 认证未启用 (config.toml [api] token 未配置)");
+    }
+
+    {
+        let mut runtime_rx = runtime.subscribe();
+        let runtime_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = runtime_rx.recv().await {
+                let _ = runtime_tx.send(WxEvent::StatusChange {
+                    from: event.from,
+                    to: event.to,
+                });
+            }
+        });
     }
 
     // 退出码: 0=正常退出, 42=重启
@@ -426,22 +490,7 @@ async fn main() -> Result<()> {
                 match db.get_new_messages().await {
                     Ok(msgs) => {
                         for m in &msgs {
-                            let json = serde_json::json!({
-                                "type": "db_message",
-                                "chat": m.chat,
-                                "chat_display": m.chat_display_name,
-                                "talker": m.talker,
-                                "talker_display": m.talker_display_name,
-                                "content": m.content,
-                                "parsed": m.parsed,
-                                "msg_type": m.msg_type,
-                                "create_time": m.create_time,
-                                "local_id": m.local_id,
-                                "is_self": m.is_self,
-                                "is_at_me": m.is_at_me,
-                                "at_user_list": m.at_user_list,
-                            });
-                            let _ = listen_tx.send(json.to_string());
+                            let _ = listen_tx.send(WxEvent::Message(m.clone()));
                         }
                     }
                     Err(e) => {
@@ -458,6 +507,7 @@ async fn main() -> Result<()> {
     if !config.listen.auto.is_empty() {
         let auto_targets = config.listen.auto.clone();
         let auto_input_tx = input_tx.clone();
+        let auto_metrics = input_metrics.clone();
         tokio::spawn(async move {
             // 等待 API 服务就绪 + 微信窗口稳定
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -465,13 +515,16 @@ async fn main() -> Result<()> {
 
             for target in &auto_targets {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                if auto_input_tx
-                    .send(api::InputCommand::AddListen {
+                if api::enqueue_input_command(
+                    &auto_input_tx,
+                    &auto_metrics,
+                    api::InputCommand::AddListen {
                         who: target.clone(),
                         reply: reply_tx,
-                    })
-                    .await
-                    .is_err()
+                    },
+                )
+                .await
+                .is_err()
                 {
                     warn!("⚠️ InputEngine actor 已停止, 无法自动添加监听");
                     break;
@@ -495,6 +548,8 @@ async fn main() -> Result<()> {
         let console_exit = exit_code.clone();
         let console_shutdown = shutdown_tx.clone();
         let console_wechat = wechat.clone();
+        let console_runtime = runtime.clone();
+        let console_metrics = input_metrics.clone();
         let console_tx = tx.clone();
         let console_input_tx = input_tx.clone();
         let console_config_path = config_path.clone();
@@ -502,6 +557,8 @@ async fn main() -> Result<()> {
             console_loop(
                 console_exit,
                 console_shutdown,
+                console_runtime,
+                console_metrics,
                 console_wechat,
                 console_db_ref,
                 console_tx,
@@ -662,9 +719,11 @@ async fn handle_command(
     cmd: &str,
     exit_code: &Arc<AtomicI32>,
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+    runtime: &Arc<RuntimeManager>,
+    input_metrics: &Arc<api::InputMetrics>,
     wechat: &Arc<wechat::WeChat>,
     db: &Option<Arc<db::DbManager>>,
-    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+    broadcast_tx: &tokio::sync::broadcast::Sender<WxEvent>,
     input_tx: &tokio::sync::mpsc::Sender<api::InputCommand>,
     config_path: &Option<PathBuf>,
 ) -> bool {
@@ -682,6 +741,7 @@ async fn handle_command(
             true
         }
         "/status" => {
+            let runtime_snapshot = runtime.snapshot().await;
             let status = wechat.check_status().await;
             let listen_list = wechat.get_listen_list().await;
             let db_status = if db.is_some() { "可用" } else { "不可用" };
@@ -691,8 +751,25 @@ async fn handle_command(
                 0
             };
             info!("📊 === 运行时状态 ===");
+            info!(
+                "📊 RuntimeState: {}{}",
+                runtime_snapshot.state,
+                runtime_snapshot
+                    .reason
+                    .as_deref()
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default()
+            );
             info!("📊 微信状态: {}", status);
             info!("📊 数据库: {} | 联系人: {} 条", db_status, contacts);
+            let input = input_metrics.snapshot();
+            info!(
+                "📊 输入队列: depth={} last={}ms max={}ms failures={}",
+                input.queue_depth,
+                input.last_command_ms,
+                input.max_command_ms,
+                input.total_failures
+            );
             info!("📊 监听窗口: {} 个 {:?}", listen_list.len(), listen_list);
             info!("📊 版本: v{}", env!("CARGO_PKG_VERSION"));
             info!("📊 ==================");
@@ -711,11 +788,9 @@ async fn handle_command(
             false
         }
         "/atmode" => {
-            let msg = serde_json::json!({
-                "type": "control",
-                "cmd": "toggle_at_mode",
+            let _ = broadcast_tx.send(WxEvent::Control {
+                cmd: "toggle_at_mode".to_string(),
             });
-            let _ = broadcast_tx.send(msg.to_string());
             info!("📢 已发送仅@模式切换指令");
             false
         }
@@ -752,13 +827,16 @@ async fn handle_command(
                                 for who in &to_remove {
                                     info!("👂 /reload 移除监听: {who}");
                                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                    if input_tx
-                                        .send(api::InputCommand::RemoveListen {
+                                    if api::enqueue_input_command(
+                                        input_tx,
+                                        input_metrics,
+                                        api::InputCommand::RemoveListen {
                                             who: who.clone(),
                                             reply: reply_tx,
-                                        })
-                                        .await
-                                        .is_ok()
+                                        },
+                                    )
+                                    .await
+                                    .is_ok()
                                     {
                                         let _ = reply_rx.await;
                                     }
@@ -766,13 +844,16 @@ async fn handle_command(
                                 for who in &to_add {
                                     info!("👂 /reload 添加监听: {who}");
                                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                    if input_tx
-                                        .send(api::InputCommand::AddListen {
+                                    if api::enqueue_input_command(
+                                        input_tx,
+                                        input_metrics,
+                                        api::InputCommand::AddListen {
                                             who: who.clone(),
                                             reply: reply_tx,
-                                        })
-                                        .await
-                                        .is_ok()
+                                        },
+                                    )
+                                    .await
+                                    .is_ok()
                                     {
                                         match reply_rx.await {
                                             Ok(Ok(true)) => info!("✅ 监听已添加: {who}"),
@@ -826,20 +907,31 @@ async fn handle_command(
                 } else {
                     info!("📤 发送消息: [{to}] → {text}");
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                    let has_db = db.is_some();
-                    if input_tx
-                        .send(api::InputCommand::SendMessage {
+                    let sent_rx = db.as_ref().map(|db| db.subscribe_sent());
+                    if api::enqueue_input_command(
+                        input_tx,
+                        input_metrics,
+                        api::InputCommand::SendMessage {
                             to: to.to_string(),
                             text: text.to_string(),
                             at: vec![],
-                            skip_verify: has_db,
+                            skip_verify: true,
                             reply: reply_tx,
-                        })
-                        .await
-                        .is_ok()
+                        },
+                    )
+                    .await
+                    .is_ok()
                     {
                         match reply_rx.await {
-                            Ok(Ok((true, _, msg))) => info!("✅ {msg}"),
+                            Ok(Ok((true, _, msg))) => {
+                                let verified = if let (Some(db), Some(rx)) = (db.as_ref(), sent_rx)
+                                {
+                                    db.verify_sent(text, rx).await.unwrap_or(false)
+                                } else {
+                                    wechat.verify_sent_after_send(to, text).await
+                                };
+                                info!("✅ {msg} | verified={verified}");
+                            }
                             Ok(Ok((false, _, msg))) => warn!("⚠️ {msg}"),
                             Ok(Err(e)) => warn!("⚠️ 发送失败: {e}"),
                             Err(_) => warn!("⚠️ actor 响应通道已关闭"),
@@ -860,13 +952,16 @@ async fn handle_command(
             } else {
                 info!("👂 添加监听: {who}");
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                if input_tx
-                    .send(api::InputCommand::AddListen {
+                if api::enqueue_input_command(
+                    input_tx,
+                    input_metrics,
+                    api::InputCommand::AddListen {
                         who: who.to_string(),
                         reply: reply_tx,
-                    })
-                    .await
-                    .is_ok()
+                    },
+                )
+                .await
+                .is_ok()
                 {
                     match reply_rx.await {
                         Ok(Ok(true)) => {
@@ -897,13 +992,16 @@ async fn handle_command(
             } else {
                 info!("👂 移除监听: {who}");
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                if input_tx
-                    .send(api::InputCommand::RemoveListen {
+                if api::enqueue_input_command(
+                    input_tx,
+                    input_metrics,
+                    api::InputCommand::RemoveListen {
                         who: who.to_string(),
                         reply: reply_tx,
-                    })
-                    .await
-                    .is_ok()
+                    },
+                )
+                .await
+                .is_ok()
                 {
                     match reply_rx.await {
                         Ok(true) => {
@@ -948,9 +1046,11 @@ async fn handle_command(
 async fn console_loop(
     exit_code: Arc<AtomicI32>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    runtime: Arc<RuntimeManager>,
+    input_metrics: Arc<api::InputMetrics>,
     wechat: Arc<wechat::WeChat>,
     db: Option<Arc<db::DbManager>>,
-    broadcast_tx: tokio::sync::broadcast::Sender<String>,
+    broadcast_tx: tokio::sync::broadcast::Sender<WxEvent>,
     input_tx: tokio::sync::mpsc::Sender<api::InputCommand>,
     config_path: Option<PathBuf>,
 ) {
@@ -961,6 +1061,8 @@ async fn console_loop(
             console_loop_simple(
                 exit_code,
                 shutdown_tx,
+                runtime,
+                input_metrics,
                 wechat,
                 db,
                 broadcast_tx,
@@ -1160,6 +1262,8 @@ async fn console_loop(
                     &cmd,
                     &exit_code,
                     &shutdown_tx,
+                    &runtime,
+                    &input_metrics,
                     &wechat,
                     &db,
                     &broadcast_tx,
@@ -1183,9 +1287,11 @@ async fn console_loop(
 async fn console_loop_simple(
     exit_code: Arc<AtomicI32>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    runtime: Arc<RuntimeManager>,
+    input_metrics: Arc<api::InputMetrics>,
     wechat: Arc<wechat::WeChat>,
     db: Option<Arc<db::DbManager>>,
-    broadcast_tx: tokio::sync::broadcast::Sender<String>,
+    broadcast_tx: tokio::sync::broadcast::Sender<WxEvent>,
     input_tx: tokio::sync::mpsc::Sender<api::InputCommand>,
     config_path: Option<PathBuf>,
 ) {
@@ -1203,6 +1309,8 @@ async fn console_loop_simple(
                         &cmd,
                         &exit_code,
                         &shutdown_tx,
+                        &runtime,
+                        &input_metrics,
                         &wechat,
                         &db,
                         &broadcast_tx,

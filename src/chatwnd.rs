@@ -13,6 +13,7 @@ use tracing::{debug, info};
 
 use crate::atspi::{AtSpi, NodeRef, SearchAction};
 use crate::input::InputEngine;
+use crate::node_handle::{NameMatch, NodeFingerprint, NodeHandle};
 use crate::wechat::ms;
 
 // =====================================================================
@@ -25,51 +26,64 @@ pub struct ChatWnd {
     /// AT-SPI2 引用
     atspi: Arc<AtSpi>,
     /// 该窗口的 AT-SPI2 根节点 (frame)
-    pub window_node: NodeRef,
-    /// 缓存的输入框节点 (DFS初始化时找到, 后续发送复用)
-    edit_box_node: Option<NodeRef>,
-    /// 缓存的消息列表节点 (发送验证复用)
-    msg_list_node: Option<NodeRef>,
+    window_node: NodeHandle,
+    /// 缓存的输入框节点
+    edit_box_node: NodeHandle,
+    /// 缓存的消息列表节点
+    msg_list_node: NodeHandle,
 }
 
 impl ChatWnd {
     /// 创建独立聊天窗口实例
     ///
     /// `window_node` 应该是 AT-SPI2 树中该独立窗口的 frame 节点
-    pub fn new(who: String, atspi: Arc<AtSpi>, window_node: NodeRef) -> Self {
+    pub fn new(who: String, atspi: Arc<AtSpi>, search_root: NodeRef, window_node: NodeRef) -> Self {
         info!("📌 创建 ChatWnd: {who}");
+        let window_fp = NodeFingerprint::new(["frame"], NameMatch::Contains(who.clone()));
+        let edit_fp = NodeFingerprint::new(["entry", "text"], NameMatch::Any);
+        let msg_list_fp = NodeFingerprint::new(
+            ["list"],
+            NameMatch::AnyOf(vec![
+                NameMatch::Contains("消息".into()),
+                NameMatch::Contains("Messages".into()),
+                NameMatch::Contains("Message".into()),
+            ]),
+        );
         Self {
             who,
             atspi,
-            window_node,
-            edit_box_node: None,
-            msg_list_node: None,
+            window_node: NodeHandle::with_current(search_root, window_fp, window_node.clone()),
+            edit_box_node: NodeHandle::new(window_node.clone(), edit_fp),
+            msg_list_node: NodeHandle::new(window_node, msg_list_fp),
         }
     }
 
     /// 刷新窗口节点引用 (窗口可能被重新创建)
     pub fn update_window_node(&mut self, node: NodeRef) {
-        self.window_node = node;
+        self.window_node.rebind(node.clone());
+        self.edit_box_node.set_search_root(node.clone());
+        self.msg_list_node.set_search_root(node);
+        self.edit_box_node.invalidate();
+        self.msg_list_node.invalidate();
     }
 
     /// 检查独立窗口是否仍然存活
     /// 通过 AT-SPI2 bbox 是否返回有效值来判断
     pub async fn is_alive(&self) -> bool {
-        if let Some(bbox) = self.atspi.bbox(&self.window_node).await {
-            bbox.w > 0 && bbox.h > 0
-        } else {
-            false
-        }
+        self.window_node.is_valid(&self.atspi).await
     }
 
     /// 初始化输入框缓存 (DFS 搜索, 只跑一次)
     ///
     /// 不限制结构性角色, 遍历所有子节点找 `entry`/`text`
     pub async fn init_edit_box(&mut self) {
-        if self.edit_box_node.is_some() {
+        if self.edit_box_node.is_valid(&self.atspi).await {
             return; // 已缓存
         }
-        let win = self.window_node.clone();
+        let Some(win) = self.window_node.resolve(&self.atspi).await else {
+            return;
+        };
+        self.edit_box_node.set_search_root(win.clone());
         if let Some(node) = self
             .atspi
             .find_dfs(
@@ -90,7 +104,7 @@ impl ChatWnd {
             .await
         {
             info!("📌 [ChatWnd] 缓存输入框节点: {}", self.who);
-            self.edit_box_node = Some(node);
+            self.edit_box_node.rebind(node);
         } else {
             info!("📌 [ChatWnd] 未找到输入框, 将使用偏移量方案: {}", self.who);
         }
@@ -98,10 +112,13 @@ impl ChatWnd {
 
     /// 初始化消息列表缓存 (DFS 搜索, 只跑一次)
     pub async fn init_msg_list(&mut self) {
-        if self.msg_list_node.is_some() {
+        if self.msg_list_node.is_valid(&self.atspi).await {
             return;
         }
-        let win = self.window_node.clone();
+        let Some(win) = self.window_node.resolve(&self.atspi).await else {
+            return;
+        };
+        self.msg_list_node.set_search_root(win.clone());
         if let Some(node) = self
             .atspi
             .find_dfs(
@@ -126,7 +143,7 @@ impl ChatWnd {
             .await
         {
             info!("📌 [ChatWnd] 缓存消息列表节点: {}", self.who);
-            self.msg_list_node = Some(node);
+            self.msg_list_node.rebind(node);
         } else {
             info!("📌 [ChatWnd] 未找到消息列表: {}", self.who);
         }
@@ -138,20 +155,14 @@ impl ChatWnd {
 
     /// 在此独立窗口中查找消息列表
     pub async fn find_message_list(&self) -> Option<NodeRef> {
-        self.atspi
-            .find_bfs(&self.window_node, |role, name| {
-                role == "list" && (name.contains("消息") || name.contains("Messages"))
-            })
-            .await
+        let mut handle = self.msg_list_node.clone();
+        handle.resolve(&self.atspi).await
     }
 
     /// 在此独立窗口中查找输入框
     pub async fn find_edit_box(&self) -> Option<NodeRef> {
-        self.atspi
-            .find_bfs(&self.window_node, |role, _| {
-                role == "entry" || role == "text"
-            })
-            .await
+        let mut handle = self.edit_box_node.clone();
+        handle.resolve(&self.atspi).await
     }
 
     // =================================================================
@@ -235,42 +246,40 @@ impl ChatWnd {
             .unwrap_or(false);
         if !activated {
             // 回退: 点击标题栏
-            if let Some(bbox) = self.atspi.bbox(&self.window_node).await {
-                let cx = bbox.x + bbox.w / 2;
-                engine.click(cx, bbox.y + 30).await?;
+            if let Some(window_node) = self.window_node.resolve(&self.atspi).await {
+                self.edit_box_node.set_search_root(window_node.clone());
+                self.msg_list_node.set_search_root(window_node.clone());
+                if let Some(bbox) = self.atspi.bbox(&window_node).await {
+                    let cx = bbox.x + bbox.w / 2;
+                    engine.click(cx, bbox.y + 30).await?;
+                }
             }
         }
         tokio::time::sleep(ms(300)).await;
 
-        // 2. 点击输入框 (缓存的精确坐标, 失效时自动重新搜索)
-        let edit_valid = if let Some(ref edit_node) = self.edit_box_node {
-            self.atspi
-                .bbox(edit_node)
-                .await
-                .map(|b| b.w > 0 && b.h > 0)
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        if !engine.active_window_contains(&self.who).unwrap_or(false) {
+            anyhow::bail!("focus lost: 独立窗口未激活 {}", self.who);
+        }
 
-        if !edit_valid {
-            // 缓存失效或未初始化 → 重新搜索
-            if self.edit_box_node.is_some() {
+        if !self.edit_box_node.is_valid(&self.atspi).await {
+            if self.find_edit_box().await.is_some() {
                 debug!("🔄 [ChatWnd] 输入框缓存失效, 重新搜索: {}", self.who);
             }
-            self.edit_box_node = None;
+            self.edit_box_node.invalidate();
             self.init_edit_box().await;
         }
 
-        if let Some(ref edit_node) = self.edit_box_node {
-            if let Some(eb) = self.atspi.bbox(edit_node).await {
+        if let Some(edit_node) = self.edit_box_node.resolve(&self.atspi).await {
+            if let Some(eb) = self.atspi.bbox(&edit_node).await {
                 let (cx, cy) = eb.center();
                 engine.click(cx, cy).await?;
                 tokio::time::sleep(ms(200)).await;
+                return Ok(());
             }
-        } else {
-            // 偏移量回退: 点击窗口底部输入区域
-            if let Some(bbox) = self.atspi.bbox(&self.window_node).await {
+        }
+
+        if let Some(window_node) = self.window_node.resolve(&self.atspi).await {
+            if let Some(bbox) = self.atspi.bbox(&window_node).await {
                 let cx = bbox.x + bbox.w / 2;
                 engine.click(cx, bbox.y + bbox.h - 50).await?;
                 tokio::time::sleep(ms(200)).await;
@@ -287,27 +296,14 @@ impl ChatWnd {
                 tokio::time::sleep(ms(500)).await;
             }
 
-            // 检查缓存的消息列表节点是否仍然有效
-            let cached_valid = if let Some(ref cached) = self.msg_list_node {
-                self.atspi
-                    .bbox(cached)
-                    .await
-                    .map(|b| b.w > 0 && b.h > 0)
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-
-            if !cached_valid {
-                if self.msg_list_node.is_some() {
-                    debug!("🔄 [ChatWnd] 消息列表缓存失效, 重新搜索: {}", self.who);
-                }
-                self.msg_list_node = None;
+            if !self.msg_list_node.is_valid(&self.atspi).await {
+                debug!("🔄 [ChatWnd] 消息列表缓存失效, 重新搜索: {}", self.who);
+                self.msg_list_node.invalidate();
                 self.init_msg_list().await;
             }
 
-            let msg_list = if let Some(ref cached) = self.msg_list_node {
-                cached.clone()
+            let msg_list = if let Some(cached) = self.msg_list_node.resolve(&self.atspi).await {
+                cached
             } else {
                 match self.find_message_list().await {
                     Some(l) => l,
@@ -319,5 +315,9 @@ impl ChatWnd {
             }
         }
         false
+    }
+
+    pub async fn verify_sent_public(&mut self, text: &str) -> bool {
+        self.verify_sent(text).await
     }
 }

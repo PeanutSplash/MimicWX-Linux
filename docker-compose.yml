@@ -1,28 +1,70 @@
 services:
   mimicwx:
-    build: .
-    container_name: mimicwx-linux
-    stdin_open: true # docker attach 需要 (-i)
-    tty: true # 终端模式 (-t)
+    build:
+      context: .
+      args:
+        INSTALL_DEBUG_TOOLS: 0
+    stdin_open: true
+    tty: true
     cap_add:
-      - SYS_ADMIN # fanotify WAL 监听
-      - SYS_PTRACE # GDB 密钥提取
+      - SYS_ADMIN
+      - SYS_PTRACE
     security_opt:
       - seccomp:unconfined
       - apparmor:unconfined
+    environment:
+      MIMICWX_DEBUG: "0"
+      MIMICWX_DISPLAY_NUM: "${MIMICWX_DISPLAY_NUM:-1}"
+      MIMICWX_BIND_ADDR: "0.0.0.0:${MIMICWX_API_PORT:-8899}"
     ports:
-      - "5901:5901" # VNC
-      - "6080:6080" # noVNC
-      - "8899:8899" # MimicWX API
+      - "${MIMICWX_API_PORT:-8899}:8899"
     volumes:
       - wechat-data:/home/wechat/.xwechat
       - .:/home/wechat/mimicwx-linux
-    shm_size: '512m'
+    shm_size: "512m"
     tmpfs:
       - /tmp
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "curl", "-sf", "http://localhost:8899/status" ]
+      test: ["CMD", "curl", "-sf", "http://localhost:8899/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  mimicwx-debug:
+    profiles: ["debug"]
+    build:
+      context: .
+      args:
+        INSTALL_DEBUG_TOOLS: 1
+    stdin_open: true
+    tty: true
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    environment:
+      MIMICWX_DEBUG: "1"
+      MIMICWX_DISPLAY_NUM: "${MIMICWX_DISPLAY_NUM:-1}"
+      MIMICWX_NOVNC_PORT: "${MIMICWX_NOVNC_PORT:-6080}"
+      MIMICWX_VNC_PORT: "${MIMICWX_VNC_PORT:-5901}"
+      MIMICWX_BIND_ADDR: "0.0.0.0:${MIMICWX_API_PORT:-8899}"
+    ports:
+      - "${MIMICWX_API_PORT:-8899}:8899"
+      - "${MIMICWX_VNC_PORT:-5901}:5901"
+      - "${MIMICWX_NOVNC_PORT:-6080}:6080"
+    volumes:
+      - wechat-data:/home/wechat/.xwechat
+      - .:/home/wechat/mimicwx-linux
+    shm_size: "512m"
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8899/status"]
       interval: 30s
       timeout: 5s
       retries: 3

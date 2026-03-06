@@ -295,186 +295,201 @@ impl InputEngine {
 
     async fn clipboard_paste(&mut self, text: &str) -> Result<()> {
         info!("📋 粘贴文本: {} 字符", text.len());
-
-        // 使用 X11 Selection 协议设置剪贴板 (无需 xclip 子进程)
-        // 流程: spawn_blocking 中获取 CLIPBOARD ownership + 事件循环
-        //       main thread 中发送 Ctrl+V, 触发 SelectionRequest
-        let text_owned = text.to_string();
         let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
+        let mut last_error = None;
 
-        // 同步通道: blocking thread 通知 ownership 已就绪
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        for attempt in 0..3 {
+            let text_owned = text.to_string();
+            let display_env = display_env.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<()>>();
 
-        let handle = tokio::task::spawn_blocking(move || -> Result<()> {
-            use x11rb::connection::Connection;
-            use x11rb::protocol::xproto::*;
-            use x11rb::protocol::Event;
-            use x11rb::wrapper::ConnectionExt as _;
+            let handle = tokio::task::spawn_blocking(move || -> Result<()> {
+                use x11rb::connection::Connection;
+                use x11rb::protocol::xproto::*;
+                use x11rb::protocol::Event;
+                use x11rb::wrapper::ConnectionExt as _;
 
-            let (conn, screen_num) =
-                x11rb::rust_connection::RustConnection::connect(Some(&display_env))
-                    .context("X11 clipboard 连接失败")?;
-            let screen = &conn.setup().roots[screen_num];
+                let (conn, screen_num) =
+                    x11rb::rust_connection::RustConnection::connect(Some(&display_env))
+                        .context("X11 clipboard 连接失败")?;
+                let screen = &conn.setup().roots[screen_num];
 
-            let clipboard = conn.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
-            let utf8_string = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
-            let targets_atom = conn.intern_atom(false, b"TARGETS")?.reply()?.atom;
+                let clipboard = conn.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
+                let utf8_string = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+                let targets_atom = conn.intern_atom(false, b"TARGETS")?.reply()?.atom;
 
-            // 隐藏窗口作为 clipboard owner
-            let win = conn.generate_id()?;
-            conn.create_window(
-                0,
-                win,
-                screen.root,
-                0,
-                0,
-                1,
-                1,
-                0,
-                WindowClass::INPUT_ONLY,
-                0,
-                &CreateWindowAux::new(),
-            )?;
-            conn.set_selection_owner(win, clipboard, x11rb::CURRENT_TIME)?;
-            conn.flush()?;
+                let win = conn.generate_id()?;
+                conn.create_window(
+                    0,
+                    win,
+                    screen.root,
+                    0,
+                    0,
+                    1,
+                    1,
+                    0,
+                    WindowClass::INPUT_ONLY,
+                    0,
+                    &CreateWindowAux::new(),
+                )?;
+                conn.set_selection_owner(win, clipboard, x11rb::CURRENT_TIME)?;
+                conn.flush()?;
 
-            let owner = conn.get_selection_owner(clipboard)?.reply()?.owner;
-            if owner != win {
+                let owner = conn.get_selection_owner(clipboard)?.reply()?.owner;
+                if owner != win {
+                    let _ = conn.destroy_window(win);
+                    let _ = conn.flush();
+                    let _ = ready_tx.send(Err(anyhow::anyhow!("无法获取 CLIPBOARD ownership")));
+                    anyhow::bail!("无法获取 CLIPBOARD ownership");
+                }
+
+                let _ = ready_tx.send(Ok(()));
+
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+
+                while std::time::Instant::now() < deadline {
+                    if let Ok(Some(event)) = conn.poll_for_event() {
+                        match event {
+                            Event::SelectionRequest(req) => {
+                                let mut reply = SelectionNotifyEvent {
+                                    response_type: xproto::SELECTION_NOTIFY_EVENT,
+                                    sequence: 0,
+                                    time: req.time,
+                                    requestor: req.requestor,
+                                    selection: req.selection,
+                                    target: req.target,
+                                    property: 0u32.into(),
+                                };
+
+                                if req.target == targets_atom {
+                                    let targets =
+                                        [targets_atom, utf8_string, AtomEnum::STRING.into()];
+                                    let _ = conn.change_property32(
+                                        PropMode::REPLACE,
+                                        req.requestor,
+                                        req.property,
+                                        AtomEnum::ATOM,
+                                        &targets,
+                                    );
+                                    reply.property = req.property;
+                                } else if req.target == utf8_string
+                                    || req.target == u32::from(AtomEnum::STRING)
+                                {
+                                    let _ = conn.change_property8(
+                                        PropMode::REPLACE,
+                                        req.requestor,
+                                        req.property,
+                                        utf8_string,
+                                        text_owned.as_bytes(),
+                                    );
+                                    reply.property = req.property;
+                                }
+
+                                let _ = conn.send_event(
+                                    false,
+                                    req.requestor,
+                                    EventMask::NO_EVENT,
+                                    reply,
+                                );
+                                let _ = conn.flush();
+
+                                if req.target == utf8_string
+                                    || req.target == u32::from(AtomEnum::STRING)
+                                {
+                                    let extra_deadline = std::time::Instant::now()
+                                        + std::time::Duration::from_millis(200);
+                                    while std::time::Instant::now() < extra_deadline {
+                                        if let Ok(Some(Event::SelectionRequest(req2))) =
+                                            conn.poll_for_event()
+                                        {
+                                            let mut r2 = SelectionNotifyEvent {
+                                                response_type: xproto::SELECTION_NOTIFY_EVENT,
+                                                sequence: 0,
+                                                time: req2.time,
+                                                requestor: req2.requestor,
+                                                selection: req2.selection,
+                                                target: req2.target,
+                                                property: 0u32.into(),
+                                            };
+                                            if req2.target == targets_atom {
+                                                let targets = [
+                                                    targets_atom,
+                                                    utf8_string,
+                                                    AtomEnum::STRING.into(),
+                                                ];
+                                                let _ = conn.change_property32(
+                                                    PropMode::REPLACE,
+                                                    req2.requestor,
+                                                    req2.property,
+                                                    AtomEnum::ATOM,
+                                                    &targets,
+                                                );
+                                                r2.property = req2.property;
+                                            } else if req2.target == utf8_string
+                                                || req2.target == u32::from(AtomEnum::STRING)
+                                            {
+                                                let _ = conn.change_property8(
+                                                    PropMode::REPLACE,
+                                                    req2.requestor,
+                                                    req2.property,
+                                                    utf8_string,
+                                                    text_owned.as_bytes(),
+                                                );
+                                                r2.property = req2.property;
+                                            }
+                                            let _ = conn.send_event(
+                                                false,
+                                                req2.requestor,
+                                                EventMask::NO_EVENT,
+                                                r2,
+                                            );
+                                            let _ = conn.flush();
+                                        } else {
+                                            std::thread::sleep(std::time::Duration::from_millis(
+                                                10,
+                                            ));
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                            Event::SelectionClear(_) => break,
+                            _ => {}
+                        }
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+
                 conn.destroy_window(win)?;
                 conn.flush()?;
-                anyhow::bail!("无法获取 CLIPBOARD ownership");
-            }
+                Ok(())
+            });
 
-            // 通知主线程: ownership 已就绪, 可以发 Ctrl+V 了
-            let _ = ready_tx.send(());
-
-            // 事件循环: 响应 SelectionRequest (Ctrl+V 触发后目标应用会请求)
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-
-            while std::time::Instant::now() < deadline {
-                if let Ok(Some(event)) = conn.poll_for_event() {
-                    match event {
-                        Event::SelectionRequest(req) => {
-                            let mut reply = SelectionNotifyEvent {
-                                response_type: 31,
-                                sequence: 0,
-                                time: req.time,
-                                requestor: req.requestor,
-                                selection: req.selection,
-                                target: req.target,
-                                property: 0u32.into(),
-                            };
-
-                            if req.target == targets_atom {
-                                let targets = [targets_atom, utf8_string, AtomEnum::STRING.into()];
-                                let _ = conn.change_property32(
-                                    PropMode::REPLACE,
-                                    req.requestor,
-                                    req.property,
-                                    AtomEnum::ATOM,
-                                    &targets,
-                                );
-                                reply.property = req.property;
-                            } else if req.target == utf8_string
-                                || req.target == u32::from(AtomEnum::STRING)
-                            {
-                                let _ = conn.change_property8(
-                                    PropMode::REPLACE,
-                                    req.requestor,
-                                    req.property,
-                                    utf8_string,
-                                    text_owned.as_bytes(),
-                                );
-                                reply.property = req.property;
-                            }
-
-                            let _ =
-                                conn.send_event(false, req.requestor, EventMask::NO_EVENT, reply);
-                            let _ = conn.flush();
-
-                            // UTF8 内容已提供,短暂等待后退出 (目标可能还会请求 TARGETS 等)
-                            if req.target == utf8_string
-                                || req.target == u32::from(AtomEnum::STRING)
-                            {
-                                // 多等 200ms 处理可能的后续请求 (如 SAVE_TARGETS)
-                                let extra_deadline = std::time::Instant::now()
-                                    + std::time::Duration::from_millis(200);
-                                while std::time::Instant::now() < extra_deadline {
-                                    if let Ok(Some(Event::SelectionRequest(req2))) =
-                                        conn.poll_for_event()
-                                    {
-                                        let mut r2 = SelectionNotifyEvent {
-                                            response_type: 31,
-                                            sequence: 0,
-                                            time: req2.time,
-                                            requestor: req2.requestor,
-                                            selection: req2.selection,
-                                            target: req2.target,
-                                            property: 0u32.into(),
-                                        };
-                                        if req2.target == targets_atom {
-                                            let targets = [
-                                                targets_atom,
-                                                utf8_string,
-                                                AtomEnum::STRING.into(),
-                                            ];
-                                            let _ = conn.change_property32(
-                                                PropMode::REPLACE,
-                                                req2.requestor,
-                                                req2.property,
-                                                AtomEnum::ATOM,
-                                                &targets,
-                                            );
-                                            r2.property = req2.property;
-                                        } else if req2.target == utf8_string
-                                            || req2.target == u32::from(AtomEnum::STRING)
-                                        {
-                                            let _ = conn.change_property8(
-                                                PropMode::REPLACE,
-                                                req2.requestor,
-                                                req2.property,
-                                                utf8_string,
-                                                text_owned.as_bytes(),
-                                            );
-                                            r2.property = req2.property;
-                                        }
-                                        let _ = conn.send_event(
-                                            false,
-                                            req2.requestor,
-                                            EventMask::NO_EVENT,
-                                            r2,
-                                        );
-                                        let _ = conn.flush();
-                                    } else {
-                                        std::thread::sleep(std::time::Duration::from_millis(10));
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                        Event::SelectionClear(_) => break,
-                        _ => {}
-                    }
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+            match ready_rx.await {
+                Ok(Ok(())) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    self.key_combo("ctrl+v").await?;
+                    handle.await??;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    return Ok(());
+                }
+                Ok(Err(err)) => {
+                    last_error = Some(err);
+                    let _ = handle.await;
+                }
+                Err(_) => {
+                    last_error = Some(anyhow::anyhow!("剪贴板同步通道已关闭"));
+                    let _ = handle.await;
                 }
             }
 
-            conn.destroy_window(win)?;
-            conn.flush()?;
-            Ok(())
-        });
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            }
+        }
 
-        // 等待 ownership 就绪后发 Ctrl+V
-        let _ = ready_rx.await;
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        self.key_combo("ctrl+v").await?;
-
-        // 等待 blocking thread 完成事件处理
-        handle.await??;
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        Ok(())
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("剪贴板粘贴失败")))
     }
 
     /// 通过剪贴板粘贴图片文件 (xclip + Ctrl+V)
@@ -708,6 +723,78 @@ impl InputEngine {
         } else {
             debug!("🖱️ 未找到标题匹配 '{title}' 的窗口");
             Ok(false)
+        }
+    }
+
+    /// 当前活动窗口标题
+    pub fn active_window_title(&self) -> Result<Option<String>> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                self.screen_root,
+                self.atom_net_active_window,
+                u32::from(AtomEnum::WINDOW),
+                0,
+                1,
+            )?
+            .reply()?;
+
+        if reply.format != 32 || reply.value.len() < 4 {
+            return Ok(None);
+        }
+
+        let win = u32::from_ne_bytes([
+            reply.value[0],
+            reply.value[1],
+            reply.value[2],
+            reply.value[3],
+        ]);
+        if win == 0 {
+            return Ok(None);
+        }
+
+        self.window_title(win)
+    }
+
+    pub fn active_window_contains(&self, title: &str) -> Result<bool> {
+        Ok(self
+            .active_window_title()?
+            .map(|current| current.contains(title))
+            .unwrap_or(false))
+    }
+
+    fn window_title(&self, win: u32) -> Result<Option<String>> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                win,
+                self.atom_net_wm_name,
+                self.atom_utf8_string,
+                0,
+                1024,
+            )?
+            .reply()?;
+        if !reply.value.is_empty() {
+            return Ok(Some(String::from_utf8_lossy(&reply.value).to_string()));
+        }
+
+        let fallback = self
+            .conn
+            .get_property(
+                false,
+                win,
+                u32::from(AtomEnum::WM_NAME),
+                u32::from(AtomEnum::STRING),
+                0,
+                1024,
+            )?
+            .reply()?;
+        if fallback.value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(String::from_utf8_lossy(&fallback.value).to_string()))
         }
     }
 

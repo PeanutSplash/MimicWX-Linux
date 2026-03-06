@@ -1,8 +1,20 @@
 #!/bin/bash
 # MimicWX-Linux 容器启动脚本
-# 启动顺序: D-Bus → VNC → AT-SPI2 → WeChat → GDB密钥提取 → noVNC → MimicWX
+# 启动顺序: D-Bus → X11/WM → AT-SPI2 → WeChat → GDB密钥提取 → MimicWX
 
 set +e  # 不因单个命令失败而退出
+
+export MIMICWX_DEBUG="${MIMICWX_DEBUG:-0}"
+export MIMICWX_DISPLAY_NUM="${MIMICWX_DISPLAY_NUM:-1}"
+export MIMICWX_DISPLAY=":${MIMICWX_DISPLAY_NUM}"
+export MIMICWX_NOVNC_PORT="${MIMICWX_NOVNC_PORT:-6080}"
+export MIMICWX_VNC_PORT="$((5900 + MIMICWX_DISPLAY_NUM))"
+
+if [ "$MIMICWX_DEBUG" = "1" ] && ! command -v vncserver >/dev/null 2>&1; then
+  echo "[start.sh] ⚠️  MIMICWX_DEBUG=1 但未安装 VNC 工具，回退到 headless 模式"
+  echo "[start.sh] 构建时请使用 INSTALL_DEBUG_TOOLS=1"
+  export MIMICWX_DEBUG=0
+fi
 
 # ============================================================
 # 0) 系统服务 (root)
@@ -24,12 +36,14 @@ chown -R wechat:wechat /home/wechat/.xwechat
 mkdir -p /tmp/.X11-unix
 chmod 1777 /tmp/.X11-unix
 
-# VNC 密码
-su - wechat -c '
-  mkdir -p ~/.vnc
-  echo "mimicwx" | vncpasswd -f > ~/.vnc/passwd
-  chmod 600 ~/.vnc/passwd
-'
+# VNC 密码 (仅 debug 模式需要)
+if [ "$MIMICWX_DEBUG" = "1" ]; then
+  su - wechat -c '
+    mkdir -p ~/.vnc
+    echo "mimicwx" | vncpasswd -f > ~/.vnc/passwd
+    chmod 600 ~/.vnc/passwd
+  '
+fi
 
 # ============================================================
 # GDB 密钥提取监视器 (root 后台)
@@ -69,29 +83,41 @@ su - wechat << 'USEREOF'
   export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
   export QT_ACCESSIBILITY=1
 
-  # 2) VNC + XFCE 桌面 (带重试和错误日志)
-  echo "[start.sh] 启动 VNC..."
-  vncserver -kill :1 2>/dev/null || true
-  sleep 1
-  vncserver :1 -geometry 1280x720 -depth 24 -localhost no 2>&1 | tee /tmp/vnc_startup.log
-  VNC_EXIT=${PIPESTATUS[0]}
-  if [ "$VNC_EXIT" != "0" ]; then
-    echo "[start.sh] ⚠️ VNC 首次启动失败 (exit=$VNC_EXIT), 清理后重试..."
-    vncserver -kill :1 2>/dev/null || true
-    rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null || true
-    sleep 2
-    vncserver :1 -geometry 1280x720 -depth 24 -localhost no 2>&1 | tee -a /tmp/vnc_startup.log
-  fi
-  export DISPLAY=:1
-  sleep 3
+  export DISPLAY="${MIMICWX_DISPLAY}"
+  export VNC_PORT="${MIMICWX_VNC_PORT}"
+  export NOVNC_PORT="${MIMICWX_NOVNC_PORT}"
 
-  # 验证 VNC 是否真正启动
-  if [ -e /tmp/.X11-unix/X1 ]; then
-    echo "[start.sh] ✅ VNC 启动成功 (DISPLAY=:1)"
+  # 2) X11 会话: 默认 headless (Xvfb + openbox), debug 才启用 VNC/XFCE
+  if [ "$MIMICWX_DEBUG" = "1" ]; then
+    echo "[start.sh] 启动 debug 桌面 (VNC + XFCE)..."
+    vncserver -kill "$DISPLAY" 2>/dev/null || true
+    rm -f "/tmp/.X${MIMICWX_DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${MIMICWX_DISPLAY_NUM}" 2>/dev/null || true
+    sleep 1
+    vncserver "$DISPLAY" -geometry 1280x720 -depth 24 -localhost no 2>&1 | tee /tmp/vnc_startup.log
+    VNC_EXIT=${PIPESTATUS[0]}
+    if [ "$VNC_EXIT" != "0" ]; then
+      echo "[start.sh] ⚠️ VNC 首次启动失败 (exit=$VNC_EXIT), 清理后重试..."
+      vncserver -kill "$DISPLAY" 2>/dev/null || true
+      rm -f "/tmp/.X${MIMICWX_DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${MIMICWX_DISPLAY_NUM}" 2>/dev/null || true
+      sleep 2
+      vncserver "$DISPLAY" -geometry 1280x720 -depth 24 -localhost no 2>&1 | tee -a /tmp/vnc_startup.log
+    fi
   else
-    echo "[start.sh] ❌ VNC 启动失败! 后续服务可能不可用"
-    echo "[start.sh] VNC 日志:"
+    echo "[start.sh] 启动 headless 桌面 (Xvfb + openbox)..."
+    pkill -f "Xvfb ${DISPLAY}" 2>/dev/null || true
+    rm -f "/tmp/.X${MIMICWX_DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${MIMICWX_DISPLAY_NUM}" 2>/dev/null || true
+    Xvfb "$DISPLAY" -screen 0 1280x720x24 -ac > /tmp/xvfb.log 2>&1 &
+    sleep 1
+    openbox > /tmp/openbox.log 2>&1 &
+  fi
+  sleep 2
+
+  if [ -e "/tmp/.X11-unix/X${MIMICWX_DISPLAY_NUM}" ]; then
+    echo "[start.sh] ✅ X11 显示已就绪 (DISPLAY=$DISPLAY)"
+  else
+    echo "[start.sh] ❌ X11 显示未就绪! 后续服务可能不可用"
     cat /tmp/vnc_startup.log 2>/dev/null || true
+    cat /tmp/xvfb.log 2>/dev/null || true
   fi
 
   # 禁用 XFCE 屏保/锁屏/电源管理 (防止息屏)
@@ -162,10 +188,14 @@ su - wechat << 'USEREOF'
     cat /tmp/wechat_stdout.log 2>/dev/null | tail -20
   fi
 
-  # 7) noVNC
-  echo "[start.sh] 启动 noVNC..."
-  websockify --web /usr/share/novnc 6080 localhost:5901 &
-  echo "[start.sh] ✅ noVNC 已启动"
+  # 7) noVNC (仅 debug)
+  if [ "$MIMICWX_DEBUG" = "1" ]; then
+    echo "[start.sh] 启动 noVNC..."
+    websockify --web /usr/share/novnc "$NOVNC_PORT" "localhost:$VNC_PORT" &
+    echo "[start.sh] ✅ noVNC 已启动 (http://localhost:${NOVNC_PORT}/vnc.html)"
+  else
+    echo "[start.sh] headless 模式: 未启动 VNC/noVNC"
+  fi
 
   # 环境变量已保存到 ~/.dbus_env (供 MimicWX 使用)
 USEREOF
@@ -175,8 +205,12 @@ USEREOF
 # ============================================================
 echo "=============================="
 echo "MimicWX-Linux Ready!"
-echo "noVNC: http://localhost:6080/vnc.html"
-echo "API:   http://localhost:8899"
+if [ "$MIMICWX_DEBUG" = "1" ]; then
+  echo "noVNC: http://localhost:${MIMICWX_NOVNC_PORT}/vnc.html"
+else
+  echo "Desktop: headless (${MIMICWX_DISPLAY})"
+fi
+echo "API:   http://${MIMICWX_BIND_ADDR:-0.0.0.0:8899}"
 echo "=============================="
 
 # 重启循环: 退出码 42 = 重启请求

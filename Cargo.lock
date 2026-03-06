@@ -908,6 +908,7 @@ name = "mimicwx"
 version = "0.5.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "atspi",
  "axum",
  "base64",

@@ -6,6 +6,7 @@
 #       海外构建可传 --build-arg USE_MIRROR=0 关闭
 
 ARG USE_MIRROR=1
+ARG INSTALL_DEBUG_TOOLS=0
 
 # ================================================================
 # Stage 1: Builder (编译 Rust 二进制)
@@ -13,6 +14,7 @@ ARG USE_MIRROR=1
 FROM ubuntu:22.04 AS builder
 
 ARG USE_MIRROR
+ARG INSTALL_DEBUG_TOOLS
 ENV DEBIAN_FRONTEND=noninteractive
 
 # APT 源: 国内用阿里云加速
@@ -62,6 +64,7 @@ RUN cargo build --release
 FROM ubuntu:22.04
 
 ARG USE_MIRROR
+ARG INSTALL_DEBUG_TOOLS
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=zh_CN.UTF-8
 ENV LANGUAGE=zh_CN:zh
@@ -74,13 +77,11 @@ RUN if [ "$USE_MIRROR" = "1" ]; then \
     sed -i 's|http://security.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list; \
     fi
 
-# 基础包 + 桌面环境 + VNC + 微信依赖 (合并为一次 apt-get, 减少层数)
+# 基础包 + headless 窗口环境 + 微信依赖
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     locales fonts-wqy-microhei fonts-wqy-zenhei fonts-noto-cjk \
-    xfce4 xfce4-terminal dbus-x11 \
-    tigervnc-standalone-server tigervnc-common \
-    novnc websockify \
+    dbus-x11 xvfb openbox xauth \
     at-spi2-core \
     xclip x11-utils \
     wget curl sudo procps net-tools gpg \
@@ -93,6 +94,14 @@ RUN apt-get update && apt-get install -y \
     libcups2 libdrm2 libgbm1 libasound2 libpango-1.0-0 \
     libcairo2 libatspi2.0-0 libgtk-3-0 \
     && rm -rf /var/lib/apt/lists/*
+
+RUN if [ "$INSTALL_DEBUG_TOOLS" = "1" ]; then \
+    apt-get update && apt-get install -y \
+    xfce4 xfce4-terminal \
+    tigervnc-standalone-server tigervnc-common \
+    novnc websockify && \
+    rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # 中文 locale + 时区
 RUN locale-gen zh_CN.UTF-8 && \
@@ -115,16 +124,17 @@ COPY --from=builder /build/target/release/mimicwx /usr/local/bin/mimicwx
 RUN chmod +x /usr/local/bin/mimicwx && \
     setcap cap_sys_admin+ep /usr/local/bin/mimicwx
 
-# VNC 配置
+# VNC 配置 (仅 debug build 实际使用)
 USER wechat
 WORKDIR /home/wechat
 
-RUN mkdir -p ~/.vnc && \
+RUN mkdir -p ~/.vnc
+RUN if [ "$INSTALL_DEBUG_TOOLS" = "1" ]; then \
     echo "mimicwx" | vncpasswd -f > ~/.vnc/passwd && \
-    chmod 600 ~/.vnc/passwd
-
-RUN printf '#!/bin/bash\nunset SESSION_MANAGER\nunset DBUS_SESSION_BUS_ADDRESS\nexport XKL_XMODMAP_DISABLE=1\nexec startxfce4\n' > ~/.vnc/xstartup && \
-    chmod +x ~/.vnc/xstartup
+    chmod 600 ~/.vnc/passwd && \
+    printf '#!/bin/bash\nunset SESSION_MANAGER\nunset DBUS_SESSION_BUS_ADDRESS\nexport XKL_XMODMAP_DISABLE=1\nexec startxfce4\n' > ~/.vnc/xstartup && \
+    chmod +x ~/.vnc/xstartup; \
+    fi
 
 # 启动脚本
 USER root
