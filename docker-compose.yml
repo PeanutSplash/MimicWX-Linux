@@ -1,5 +1,6 @@
 services:
   mimicwx:
+    container_name: mimicwx-linux
     build:
       context: .
       args:
