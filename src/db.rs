@@ -76,7 +76,12 @@ pub enum MsgContent {
     /// 表情包 (msg_type=47)
     Emoji { url: Option<String> },
     /// 链接/文件/小程序 (msg_type=49)
-    App { title: Option<String>, desc: Option<String>, url: Option<String>, app_type: Option<i32> },
+    App {
+        title: Option<String>,
+        desc: Option<String>,
+        url: Option<String>,
+        app_type: Option<i32>,
+    },
     /// 系统消息 (msg_type=10000/10002)
     System { text: String },
     /// 未知类型
@@ -103,16 +108,19 @@ impl MsgContent {
         let text = match self {
             Self::Text { text } => text.clone(),
             Self::Image { .. } => "[图片]".into(),
-            Self::Voice { duration_ms, .. } => {
-                match duration_ms {
-                    Some(ms) if *ms >= 1000 => format!("[语音 {}s]", ms / 1000),
-                    Some(ms) if *ms > 0 => format!("[语音 {ms}ms]"),
-                    _ => "[语音]".into(),
-                }
-            }
+            Self::Voice { duration_ms, .. } => match duration_ms {
+                Some(ms) if *ms >= 1000 => format!("[语音 {}s]", ms / 1000),
+                Some(ms) if *ms > 0 => format!("[语音 {ms}ms]"),
+                _ => "[语音]".into(),
+            },
             Self::Video { .. } => "[视频]".into(),
             Self::Emoji { url, .. } => format!("[表情] {}", url.as_deref().unwrap_or("")),
-            Self::App { title, desc, app_type, .. } => {
+            Self::App {
+                title,
+                desc,
+                app_type,
+                ..
+            } => {
                 let t = title.as_deref().unwrap_or("");
                 let d = desc.as_deref().unwrap_or("");
                 // 子类型 + 标题后缀推断
@@ -127,11 +135,21 @@ impl MsgContent {
                     _ => {
                         // 子类型提取失败时, 用标题后缀推断文件
                         let tl = t.to_lowercase();
-                        if tl.ends_with(".pdf") || tl.ends_with(".doc") || tl.ends_with(".docx")
-                            || tl.ends_with(".xls") || tl.ends_with(".xlsx") || tl.ends_with(".ppt")
-                            || tl.ends_with(".pptx") || tl.ends_with(".zip") || tl.ends_with(".rar")
-                            || tl.ends_with(".7z") || tl.ends_with(".txt") || tl.ends_with(".csv")
-                            || tl.ends_with(".apk") || tl.ends_with(".exe") || tl.ends_with(".dmg")
+                        if tl.ends_with(".pdf")
+                            || tl.ends_with(".doc")
+                            || tl.ends_with(".docx")
+                            || tl.ends_with(".xls")
+                            || tl.ends_with(".xlsx")
+                            || tl.ends_with(".ppt")
+                            || tl.ends_with(".pptx")
+                            || tl.ends_with(".zip")
+                            || tl.ends_with(".rar")
+                            || tl.ends_with(".7z")
+                            || tl.ends_with(".txt")
+                            || tl.ends_with(".csv")
+                            || tl.ends_with(".apk")
+                            || tl.ends_with(".exe")
+                            || tl.ends_with(".dmg")
                         {
                             "文件"
                         } else {
@@ -139,9 +157,13 @@ impl MsgContent {
                         }
                     }
                 };
-                if !t.is_empty() { format!("[{label}] {t}") }
-                else if !d.is_empty() { format!("[{label}] {d}") }
-                else { format!("[{label}]") }
+                if !t.is_empty() {
+                    format!("[{label}] {t}")
+                } else if !d.is_empty() {
+                    format!("[{label}] {d}")
+                } else {
+                    format!("[{label}]")
+                }
             }
             Self::System { text } => format!("[系统] {text}"),
             Self::Unknown { msg_type, .. } => format!("[type={msg_type}]"),
@@ -242,22 +264,26 @@ pub struct DbManager {
 impl DbManager {
     /// 创建 DbManager
     pub fn new(key_hex: String, db_dir: PathBuf) -> Result<Self> {
-        let key_bytes = hex_to_bytes(&key_hex)
-            .context("密钥 hex 格式错误")?;
-        anyhow::ensure!(key_bytes.len() == 32, "密钥长度必须为 32 字节, 实际: {}", key_bytes.len());
+        let key_bytes = hex_to_bytes(&key_hex).context("密钥 hex 格式错误")?;
+        anyhow::ensure!(
+            key_bytes.len() == 32,
+            "密钥长度必须为 32 字节, 实际: {}",
+            key_bytes.len()
+        );
 
         info!("📦 DbManager 初始化: db_dir={}", db_dir.display());
 
         // 从 db_dir 路径提取自己的 wxid
         // 路径格式: .../wxid_xxx_c024/db_storage
-        let self_wxid = db_dir.components()
+        let self_wxid = db_dir
+            .components()
             .filter_map(|c| c.as_os_str().to_str())
             .find(|s| s.starts_with("wxid_"))
             .map(|s| {
                 // 去掉目录名中的设备后缀 (如 _c024, _ac17 等)
                 // wxid 本体一般为 wxid_xxxx 格式, 后缀由微信附加
                 if let Some(pos) = s.rfind('_') {
-                    let suffix = &s[pos+1..];
+                    let suffix = &s[pos + 1..];
                     // 后缀较短 (≤6字符) 且不以 wxid 开头 → 视为设备后缀
                     if suffix.len() <= 6
                         && suffix.len() >= 2
@@ -333,9 +359,9 @@ impl DbManager {
         // 配合 PRAGMA query_only=ON 防止意外写入
         let conn = Connection::open_with_flags(
             &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ).with_context(|| format!("打开数据库失败: {}", path.display()))?;
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("打开数据库失败: {}", path.display()))?;
 
         // 通过 FFI 调用 sqlite3_key() 传递 raw key
         let rc = unsafe {
@@ -356,17 +382,22 @@ impl DbManager {
         conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
 
         // 验证解密成功
-        let count: i32 = conn.query_row(
-            "SELECT count(*) FROM sqlite_master", [], |row| row.get(0),
-        ).with_context(|| format!("数据库解密验证失败: {}", db_name))?;
+        let count: i32 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .with_context(|| format!("数据库解密验证失败: {}", db_name))?;
 
         trace!("🔓 {} 解密成功, {} 个表", db_name, count);
         Ok(conn)
     }
 
     /// 确保至少有一个 message 数据库连接可用 (如为空则重新扫描)
-    fn ensure_msg_conns(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, Arc<std::sync::Mutex<Connection>>>>> {
-        let mut guard = self.msg_conns.lock().map_err(|e| anyhow::anyhow!("msg_conns lock poisoned: {}", e))?;
+    fn ensure_msg_conns(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<String, Arc<std::sync::Mutex<Connection>>>>> {
+        let mut guard = self
+            .msg_conns
+            .lock()
+            .map_err(|e| anyhow::anyhow!("msg_conns lock poisoned: {}", e))?;
         if guard.is_empty() {
             info!("🔗 重新扫描 message 数据库...");
             let msg_dir = self.db_dir.join("message");
@@ -377,7 +408,9 @@ impl DbManager {
                         if is_message_db(&name) {
                             let rel_path = format!("message/{}", name);
                             if !guard.contains_key(&rel_path) {
-                                if let Ok(conn) = Self::open_db(&self.key_bytes, &self.db_dir, &rel_path) {
+                                if let Ok(conn) =
+                                    Self::open_db(&self.key_bytes, &self.db_dir, &rel_path)
+                                {
                                     info!("🔗 {} 持久连接已建立", name);
                                     guard.insert(rel_path, Arc::new(std::sync::Mutex::new(conn)));
                                 }
@@ -403,39 +436,53 @@ impl DbManager {
 
         let contacts = tokio::task::spawn_blocking(move || -> Result<Vec<ContactInfo>> {
             // 复用或创建持久连接
-            let mut guard = conn_mutex.lock().map_err(|e| anyhow::anyhow!("contact_conn lock: {}", e))?;
+            let mut guard = conn_mutex
+                .lock()
+                .map_err(|e| anyhow::anyhow!("contact_conn lock: {}", e))?;
             if guard.is_none() {
                 *guard = Some(Self::open_db(&key, &dir, "contact/contact.db")?);
                 info!("🔗 contact.db 持久连接已建立");
             }
             let conn = guard.as_ref().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT username, nick_name, remark, alias FROM contact"
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT username, nick_name, remark, alias FROM contact")?;
             // WCDB 压缩可能导致 TEXT 列实际存储为 BLOB (Zstd),
             // 必须用 BLOB 回退读取, 否则部分行 (包括 chatroom) 会被丢弃
-            let result: Vec<ContactInfo> = stmt.query_map([], |row| {
-                let username = wcdb_get_text(row, 0);
-                if username.is_empty() {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
-                let nick_name = wcdb_get_text(row, 1);
-                let remark = wcdb_get_text(row, 2);
-                let alias = wcdb_get_text(row, 3);
-                let display_name = if !remark.is_empty() {
-                    remark.clone()
-                } else if !nick_name.is_empty() {
-                    nick_name.clone()
-                } else {
-                    username.clone()
-                };
-                Ok(ContactInfo { username, nick_name, remark, alias, display_name })
-            })?.filter_map(|r| match r {
-                Ok(c) => Some(c),
-                Err(e) => { warn!("⚠️ 联系人行读取失败: {}", e); None }
-            }).collect();
+            let result: Vec<ContactInfo> = stmt
+                .query_map([], |row| {
+                    let username = wcdb_get_text(row, 0);
+                    if username.is_empty() {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    let nick_name = wcdb_get_text(row, 1);
+                    let remark = wcdb_get_text(row, 2);
+                    let alias = wcdb_get_text(row, 3);
+                    let display_name = if !remark.is_empty() {
+                        remark.clone()
+                    } else if !nick_name.is_empty() {
+                        nick_name.clone()
+                    } else {
+                        username.clone()
+                    };
+                    Ok(ContactInfo {
+                        username,
+                        nick_name,
+                        remark,
+                        alias,
+                        display_name,
+                    })
+                })?
+                .filter_map(|r| match r {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        warn!("⚠️ 联系人行读取失败: {}", e);
+                        None
+                    }
+                })
+                .collect();
             Ok(result)
-        }).await??;
+        })
+        .await??;
 
         let count = contacts.len();
         // 短暂持锁: 清空并填入联系人
@@ -452,21 +499,25 @@ impl DbManager {
         let chatrooms = {
             let conn_mutex2 = Arc::clone(&self.contact_conn);
             tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>> {
-                let guard = conn_mutex2.lock().map_err(|e| anyhow::anyhow!("contact_conn lock: {}", e))?;
+                let guard = conn_mutex2
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("contact_conn lock: {}", e))?;
                 if let Some(conn) = guard.as_ref() {
                     let mut result = Vec::new();
                     if let Ok(mut stmt) = conn.prepare(
                         "SELECT cr.username, c.nick_name FROM chat_room cr \
                          LEFT JOIN contact c ON cr.username = c.username \
-                         WHERE cr.username IS NOT NULL"
+                         WHERE cr.username IS NOT NULL",
                     ) {
-                        let rows: Vec<(String, String)> = stmt.query_map([], |row| {
-                            let id = wcdb_get_text(row, 0);
-                            let name = wcdb_get_text(row, 1);
-                            Ok((id, name))
-                        }).ok()
-                        .map(|iter| iter.filter_map(|r| r.ok()).collect())
-                        .unwrap_or_default();
+                        let rows: Vec<(String, String)> = stmt
+                            .query_map([], |row| {
+                                let id = wcdb_get_text(row, 0);
+                                let name = wcdb_get_text(row, 1);
+                                Ok((id, name))
+                            })
+                            .ok()
+                            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+                            .unwrap_or_default();
 
                         for (id, name) in rows {
                             if !id.is_empty() && !name.is_empty() {
@@ -479,7 +530,10 @@ impl DbManager {
                 } else {
                     Ok(vec![])
                 }
-            }).await.unwrap_or_else(|_| Ok(vec![])).unwrap_or_default()
+            })
+            .await
+            .unwrap_or_else(|_| Ok(vec![]))
+            .unwrap_or_default()
         };
 
         // 短暂持锁: 补充群名
@@ -488,13 +542,16 @@ impl DbManager {
             let mut added = 0usize;
             for (chatroom_id, nick_name) in chatrooms {
                 if !cache.contains_key(&chatroom_id) {
-                    cache.insert(chatroom_id.clone(), ContactInfo {
-                        username: chatroom_id,
-                        nick_name: nick_name.clone(),
-                        remark: String::new(),
-                        alias: String::new(),
-                        display_name: nick_name,
-                    });
+                    cache.insert(
+                        chatroom_id.clone(),
+                        ContactInfo {
+                            username: chatroom_id,
+                            nick_name: nick_name.clone(),
+                            remark: String::new(),
+                            alias: String::new(),
+                            display_name: nick_name,
+                        },
+                    );
                     added += 1;
                 }
             }
@@ -505,7 +562,10 @@ impl DbManager {
 
         // 尝试解析当前账号的显示名 (短暂持锁读取, 然后释放)
         if !self.self_wxid.is_empty() {
-            let name = self.contacts.lock().await
+            let name = self
+                .contacts
+                .lock()
+                .await
                 .get(&self.self_wxid)
                 .map(|c| c.display_name.clone());
             if let Some(name) = name {
@@ -513,7 +573,6 @@ impl DbManager {
                 *self.self_display_name.write().await = name;
             }
         }
-
 
         Ok(count)
     }
@@ -525,7 +584,9 @@ impl DbManager {
 
     /// 通过 username 获取显示名
     async fn resolve_name(&self, username: &str) -> String {
-        self.contacts.lock().await
+        self.contacts
+            .lock()
+            .await
             .get(username)
             .map(|c| c.display_name.clone())
             .unwrap_or_else(|| username.to_string())
@@ -541,36 +602,49 @@ impl DbManager {
         let dir = self.db_dir.clone();
         let conn_mutex = Arc::clone(&self.session_conn);
 
-        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<(String, i32, String, i64, String)>> {
-            // 复用或创建持久连接
-            let mut guard = conn_mutex.lock().map_err(|e| anyhow::anyhow!("session_conn lock: {}", e))?;
-            if guard.is_none() {
-                *guard = Some(Self::open_db(&key, &dir, "session/session.db")?);
-                info!("🔗 session.db 持久连接已建立");
-            }
-            let conn = guard.as_ref().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT username, unread_count, summary, last_timestamp, last_msg_sender \
-                 FROM SessionTable ORDER BY sort_timestamp DESC"
-            )?;
-            let result = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<i32>>(1)?.unwrap_or(0),
-                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                    row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                ))
-            })?.filter_map(|r| r.ok()).collect();
-            Ok(result)
-        }).await??;
+        let rows = tokio::task::spawn_blocking(
+            move || -> Result<Vec<(String, i32, String, i64, String)>> {
+                // 复用或创建持久连接
+                let mut guard = conn_mutex
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("session_conn lock: {}", e))?;
+                if guard.is_none() {
+                    *guard = Some(Self::open_db(&key, &dir, "session/session.db")?);
+                    info!("🔗 session.db 持久连接已建立");
+                }
+                let conn = guard.as_ref().unwrap();
+                let mut stmt = conn.prepare(
+                    "SELECT username, unread_count, summary, last_timestamp, last_msg_sender \
+                 FROM SessionTable ORDER BY sort_timestamp DESC",
+                )?;
+                let result = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i32>>(1)?.unwrap_or(0),
+                            row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                            row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                            row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        ))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(result)
+            },
+        )
+        .await??;
 
         // 异步填充显示名
         let mut sessions = Vec::with_capacity(rows.len());
         for (username, unread_count, summary, last_timestamp, last_msg_sender) in rows {
             let display_name = self.resolve_name(&username).await;
             sessions.push(DbSessionInfo {
-                username, display_name, unread_count, summary, last_timestamp, last_msg_sender,
+                username,
+                display_name,
+                unread_count,
+                summary,
+                last_timestamp,
+                last_msg_sender,
             });
         }
         Ok(sessions)
@@ -587,7 +661,8 @@ impl DbManager {
         // 克隆 Arc 引用传入 spawn_blocking (安全, 无 unsafe)
         let conn_arcs: Vec<(String, Arc<std::sync::Mutex<Connection>>)> = {
             let conns_guard = self.ensure_msg_conns()?;
-            conns_guard.iter()
+            conns_guard
+                .iter()
                 .map(|(name, conn)| (name.clone(), Arc::clone(conn)))
                 .collect()
         };
@@ -595,7 +670,8 @@ impl DbManager {
         // 获取表结构缓存: key = "db_name::table_name" → TableMeta
         // 每次都查表列表 (1 条 SQL, 很快), 但只对新出现的表执行 PRAGMA
         let cached_meta: HashMap<String, TableMeta> = {
-            self.table_meta_cache.lock()
+            self.table_meta_cache
+                .lock()
                 .map(|g| g.clone())
                 .unwrap_or_default()
         };
@@ -643,7 +719,7 @@ impl DbManager {
                             let local_id: i64 = row.get(0)?;
                             let svr_id: i64 = row.get::<_, Option<i64>>(1)?.unwrap_or(0);
                             let ts: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
-                            
+
                             // message_content: 先尝试读为文本，失败则读 BLOB + Zstd 解压
                             let content = match row.get::<_, Option<String>>(3) {
                                 Ok(s) => s.unwrap_or_default(),
@@ -655,9 +731,9 @@ impl DbManager {
                                     }
                                 }
                             };
-                            
+
                             let msg_type: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
-                            
+
                             let sender = match row.get::<_, Option<String>>(5) {
                                 Ok(s) => s.unwrap_or_default(),
                                 Err(_) => match row.get::<_, Option<Vec<u8>>>(5) {
@@ -670,7 +746,7 @@ impl DbManager {
 
                             // source 列: 消息元数据 XML (含 atuserlist 等)
                             let source = wcdb_get_text(row, 7);
-                            
+
                             Ok((local_id, svr_id, ts, content, msg_type, sender, status, source))
                         }) {
                         Ok(rows) => rows.filter_map(|r| match r {
@@ -704,8 +780,6 @@ impl DbManager {
                 cache.entry(k).or_insert(v);
             }
         }
-
-
 
         // 更新高水位线
         if !raw_msgs.is_empty() {
@@ -744,9 +818,8 @@ impl DbManager {
             // status bit 1 (0x02): 1=收到的消息, 0=自己发的消息
             // 注意: 系统消息 (10000/10002) 的 status 可能也为 0, 需排除
             let base_msg_type = (m.msg_type & 0xFFFF) as i32;
-            let is_self = (m.status & 0x02) == 0
-                && base_msg_type != 10000
-                && base_msg_type != 10002;
+            let is_self =
+                (m.status & 0x02) == 0 && base_msg_type != 10000 && base_msg_type != 10002;
 
             // talker 为空时填充: 自发用 self_wxid, 私聊收到用 chat(对方)
             if talker.is_empty() {
@@ -771,19 +844,24 @@ impl DbManager {
                 } else {
                     content.clone()
                 };
-                debug!("🔍 msg_type={} (base={}) raw: {}", m.msg_type, base_type, raw_preview);
+                debug!(
+                    "🔍 msg_type={} (base={}) raw: {}",
+                    m.msg_type, base_type, raw_preview
+                );
             }
             let parsed = parse_msg_content(m.msg_type, &content);
 
             // 解析 @ 列表: 从 source 列的 <atuserlist> 提取被 @ 者的 wxid
             let at_user_list: Vec<String> = extract_xml_text(&m.source, "atuserlist")
-                .map(|s| s.split(',')
-                    .map(|w| w.trim().to_string())
-                    .filter(|w| !w.is_empty())
-                    .collect())
+                .map(|s| {
+                    s.split(',')
+                        .map(|w| w.trim().to_string())
+                        .filter(|w| !w.is_empty())
+                        .collect()
+                })
                 .unwrap_or_default();
-            let is_at_me = !self.self_wxid.is_empty()
-                && at_user_list.iter().any(|w| w == &self.self_wxid);
+            let is_at_me =
+                !self.self_wxid.is_empty() && at_user_list.iter().any(|w| w == &self.self_wxid);
 
             result.push(DbMessage {
                 local_id: m.local_id,
@@ -812,11 +890,12 @@ impl DbManager {
             let preview = m.parsed.preview(40);
             let icon = if m.is_self { "📤 →" } else { "📨" };
             if m.chat.contains("@chatroom") {
-                info!("{icon} [{}] {}({}): {}",
-                    m.chat_display_name, m.talker_display_name, m.talker, preview);
+                info!(
+                    "{icon} [{}] {}({}): {}",
+                    m.chat_display_name, m.talker_display_name, m.talker, preview
+                );
             } else {
-                info!("{icon} {}({}): {}",
-                    m.chat_display_name, m.talker, preview);
+                info!("{icon} {}({}): {}", m.chat_display_name, m.talker, preview);
             }
         }
         Ok(result)
@@ -827,7 +906,8 @@ impl DbManager {
         // 克隆 Arc 引用传入 spawn_blocking
         let conn_arcs: Vec<(String, Arc<std::sync::Mutex<Connection>>)> = {
             let conns_guard = self.ensure_msg_conns()?;
-            conns_guard.iter()
+            conns_guard
+                .iter()
                 .map(|(name, conn)| (name.clone(), Arc::clone(conn)))
                 .collect()
         };
@@ -837,8 +917,12 @@ impl DbManager {
             let mut total_tables = 0;
 
             for (db_name, conn_arc) in &conn_arcs {
-                let conn = conn_arc.lock().map_err(|e| anyhow::anyhow!("conn lock: {}", e))?;
-                let db_prefix = db_name.trim_start_matches("message/").trim_end_matches(".db");
+                let conn = conn_arc
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("conn lock: {}", e))?;
+                let db_prefix = db_name
+                    .trim_start_matches("message/")
+                    .trim_end_matches(".db");
 
                 // 复用 discover_msg_tables + build_single_table_meta (消除重复 PRAGMA)
                 let tables = discover_msg_tables(&conn);
@@ -846,7 +930,9 @@ impl DbManager {
                     if let Some(meta) = build_single_table_meta(&conn, table) {
                         let wm_key = format!("{}::{}", db_prefix, table);
                         let sql = format!("SELECT MAX({}) FROM [{}]", meta.id_col, table);
-                        if let Ok(max_id) = conn.query_row(&sql, [], |row| row.get::<_, Option<i64>>(0)) {
+                        if let Ok(max_id) =
+                            conn.query_row(&sql, [], |row| row.get::<_, Option<i64>>(0))
+                        {
                             if let Some(id) = max_id {
                                 watermarks.insert(wm_key, id);
                             }
@@ -855,9 +941,14 @@ impl DbManager {
                 }
                 total_tables += tables.len();
             }
-            info!("✅ 已标记 {} 个消息表为已读 (跨 {} 个数据库)", total_tables, conn_arcs.len());
+            info!(
+                "✅ 已标记 {} 个消息表为已读 (跨 {} 个数据库)",
+                total_tables,
+                conn_arcs.len()
+            );
             Ok(watermarks)
-        }).await??;
+        })
+        .await??;
 
         *self.watermarks.lock().await = wm;
         Ok(())
@@ -873,7 +964,11 @@ impl DbManager {
     /// 无需单独查询 DB, 完全复用现有的消息检测流程.
     /// 调用方应在发送前调用 subscribe_sent() 获取 receiver, 避免竞态.
     /// 超时 5 秒兜底.
-    pub async fn verify_sent(&self, text: &str, mut sent_rx: tokio::sync::broadcast::Receiver<String>) -> Result<bool> {
+    pub async fn verify_sent(
+        &self,
+        text: &str,
+        mut sent_rx: tokio::sync::broadcast::Receiver<String>,
+    ) -> Result<bool> {
         let text_owned = text.to_string();
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -946,7 +1041,11 @@ impl DbManager {
 /// 从消息表名解析会话 username
 /// ChatMsg_<rowid> -> Name2Id.user_name WHERE rowid = <id>
 /// Msg_<hash> -> MD5(Name2Id.user_name) == hash (使用缓存 O(1) 查找)
-fn resolve_chat_from_table(table_name: &str, conn: &Connection, cache: &mut HashMap<String, String>) -> String {
+fn resolve_chat_from_table(
+    table_name: &str,
+    conn: &Connection,
+    cache: &mut HashMap<String, String>,
+) -> String {
     // 尝试 ChatMsg_<数字> 格式 -> 按 rowid 查找
     if let Some(suffix) = table_name.strip_prefix("ChatMsg_") {
         if let Ok(id) = suffix.parse::<i64>() {
@@ -959,7 +1058,8 @@ fn resolve_chat_from_table(table_name: &str, conn: &Connection, cache: &mut Hash
     }
 
     // 尝试 Msg_<hash> / MSG_<hash> / Chat_<hash> 格式
-    if let Some(hash) = table_name.strip_prefix("Msg_")
+    if let Some(hash) = table_name
+        .strip_prefix("Msg_")
         .or_else(|| table_name.strip_prefix("MSG_"))
         .or_else(|| table_name.strip_prefix("Chat_"))
     {
@@ -1026,8 +1126,7 @@ fn wal_watch_loop(db_dir: &Path, tx: tokio::sync::broadcast::Sender<()>) -> Resu
     }
 
     // 初始化 fanotify (通知模式, 阻塞读取)
-    let fan = Fanotify::new_blocking(FanotifyMode::NOTIF)
-        .with_context(|| "fanotify 初始化失败")?;
+    let fan = Fanotify::new_blocking(FanotifyMode::NOTIF).with_context(|| "fanotify 初始化失败")?;
 
     // 使用 FAN_MARK_MOUNT (挂载点级别标记) 而非 add_path (Inode 级标记)
     // 原因: add_path 对目录的 Inode 标记只监听目录自身的修改,
@@ -1038,7 +1137,10 @@ fn wal_watch_loop(db_dir: &Path, tx: tokio::sync::broadcast::Sender<()>) -> Resu
     fan.add_mountpoint(FanEvent::Modify.into(), &msg_dir)
         .with_context(|| format!("fanotify add_mountpoint 失败: {}", msg_dir.display()))?;
 
-    info!("👁️ 开始监听 WAL: {} (fanotify FAN_MARK_MOUNT, 无冷却期)", wal_path.display());
+    info!(
+        "👁️ 开始监听 WAL: {} (fanotify FAN_MARK_MOUNT, 无冷却期)",
+        wal_path.display()
+    );
 
     let msg_dir_prefix = msg_dir.to_string_lossy().to_string();
 
@@ -1103,14 +1205,13 @@ fn wcdb_get_text(row: &rusqlite::Row, idx: usize) -> String {
 fn discover_msg_tables(conn: &Connection) -> Vec<String> {
     match conn.prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND \
-         (name LIKE 'ChatMsg_%' OR name LIKE 'MSG_%' OR name LIKE 'Chat_%')"
+         (name LIKE 'ChatMsg_%' OR name LIKE 'MSG_%' OR name LIKE 'Chat_%')",
     ) {
-        Ok(mut stmt) => {
-            stmt.query_map([], |row| row.get(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-        }
+        Ok(mut stmt) => stmt
+            .query_map([], |row| row.get(0))
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }
@@ -1122,40 +1223,60 @@ fn build_single_table_meta(conn: &Connection, table: &str) -> Option<TableMeta> 
     let columns: Vec<String> = pragma_stmt
         .query_map([], |row| row.get::<_, String>(1))
         .ok()?
-        .filter_map(|r| r.ok()).collect();
+        .filter_map(|r| r.ok())
+        .collect();
 
-    let id_col = columns.iter().find(|c| {
-        c.eq_ignore_ascii_case("local_id") || c.eq_ignore_ascii_case("localId")
-            || c.eq_ignore_ascii_case("rowid")
-    }).cloned().unwrap_or_else(|| "rowid".to_string());
+    let id_col = columns
+        .iter()
+        .find(|c| {
+            c.eq_ignore_ascii_case("local_id")
+                || c.eq_ignore_ascii_case("localId")
+                || c.eq_ignore_ascii_case("rowid")
+        })
+        .cloned()
+        .unwrap_or_else(|| "rowid".to_string());
 
-    let time_col = columns.iter().find(|c| {
-        c.eq_ignore_ascii_case("create_time") || c.eq_ignore_ascii_case("createTime")
-    }).cloned();
+    let time_col = columns
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case("create_time") || c.eq_ignore_ascii_case("createTime"))
+        .cloned();
 
-    let content_col = columns.iter().find(|c| {
-        c.eq_ignore_ascii_case("message_content")
-            || c.eq_ignore_ascii_case("content")
-            || c.eq_ignore_ascii_case("msgContent")
-            || c.eq_ignore_ascii_case("compress_content")
-    }).cloned();
+    let content_col = columns
+        .iter()
+        .find(|c| {
+            c.eq_ignore_ascii_case("message_content")
+                || c.eq_ignore_ascii_case("content")
+                || c.eq_ignore_ascii_case("msgContent")
+                || c.eq_ignore_ascii_case("compress_content")
+        })
+        .cloned();
 
-    let type_col = columns.iter().find(|c| {
-        c.eq_ignore_ascii_case("local_type")
-            || c.eq_ignore_ascii_case("type")
-            || c.eq_ignore_ascii_case("msgType")
-    }).cloned();
+    let type_col = columns
+        .iter()
+        .find(|c| {
+            c.eq_ignore_ascii_case("local_type")
+                || c.eq_ignore_ascii_case("type")
+                || c.eq_ignore_ascii_case("msgType")
+        })
+        .cloned();
 
-    let talker_col = columns.iter().find(|c| {
-        c.eq_ignore_ascii_case("real_sender_id")
-            || c.eq_ignore_ascii_case("talker")
-            || c.eq_ignore_ascii_case("talkerId")
-    }).cloned();
+    let talker_col = columns
+        .iter()
+        .find(|c| {
+            c.eq_ignore_ascii_case("real_sender_id")
+                || c.eq_ignore_ascii_case("talker")
+                || c.eq_ignore_ascii_case("talkerId")
+        })
+        .cloned();
 
-    let svr_col = columns.iter().find(|c| {
-        c.eq_ignore_ascii_case("server_id") || c.eq_ignore_ascii_case("svrid")
-            || c.eq_ignore_ascii_case("msgSvrId")
-    }).cloned();
+    let svr_col = columns
+        .iter()
+        .find(|c| {
+            c.eq_ignore_ascii_case("server_id")
+                || c.eq_ignore_ascii_case("svrid")
+                || c.eq_ignore_ascii_case("msgSvrId")
+        })
+        .cloned();
 
     let content_sel = content_col.as_deref()?;
     let time_sel = time_col.as_deref().unwrap_or("0");
@@ -1163,22 +1284,30 @@ fn build_single_table_meta(conn: &Connection, table: &str) -> Option<TableMeta> 
     let talker_sel = talker_col.as_deref().unwrap_or("''");
     let svr_sel = svr_col.as_deref().unwrap_or("0");
 
-    let status_col = columns.iter().find(|c| {
-        c.eq_ignore_ascii_case("status")
-    }).cloned();
+    let status_col = columns
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case("status"))
+        .cloned();
     let status_sel = status_col.as_deref().unwrap_or("0");
 
-    let source_col = columns.iter().find(|c| {
-        c.eq_ignore_ascii_case("source")
-    }).cloned();
+    let source_col = columns
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case("source"))
+        .cloned();
     let source_sel = source_col.as_deref().unwrap_or("''");
 
     let select_sql = format!(
         "SELECT {id}, {svr}, {time}, {content}, {typ}, {talker}, {status}, {source} \
          FROM [{tbl}] WHERE {id} > ?1 ORDER BY {id} ASC",
-        id = id_col, svr = svr_sel, time = time_sel,
-        content = content_sel, typ = type_sel, talker = talker_sel,
-        status = status_sel, source = source_sel, tbl = table,
+        id = id_col,
+        svr = svr_sel,
+        time = time_sel,
+        content = content_sel,
+        typ = type_sel,
+        talker = talker_sel,
+        status = status_sel,
+        source = source_sel,
+        tbl = table,
     );
 
     Some(TableMeta {
@@ -1194,15 +1323,22 @@ fn parse_msg_content(msg_type: i64, content: &str) -> MsgContent {
     // 微信 msg_type 高位是标志位 (如 0x600000021), 实际类型在低 16 位
     let base_type = (msg_type & 0xFFFF) as i32;
     match base_type {
-        1 => MsgContent::Text { text: content.to_string() },
+        1 => MsgContent::Text {
+            text: content.to_string(),
+        },
         3 => parse_image(content),
         34 => parse_voice(content),
         42 => parse_contact_card(content),
         43 => parse_video(content),
         47 => parse_emoji(content),
         49 => parse_app(content),
-        10000 | 10002 => MsgContent::System { text: content.to_string() },
-        _ => MsgContent::Unknown { raw: content.to_string(), msg_type },
+        10000 | 10002 => MsgContent::System {
+            text: content.to_string(),
+        },
+        _ => MsgContent::Unknown {
+            raw: content.to_string(),
+            msg_type,
+        },
     }
 }
 
@@ -1254,10 +1390,12 @@ fn parse_app(content: &str) -> MsgContent {
     let title = extract_xml_text(content, "title");
     let desc = extract_xml_text(content, "des");
     let url = extract_xml_text(content, "url");
-    let app_type = extract_xml_text(content, "type")
-        .and_then(|t| t.parse::<i32>().ok());
+    let app_type = extract_xml_text(content, "type").and_then(|t| t.parse::<i32>().ok());
     MsgContent::App {
-        title, desc, url, app_type,
+        title,
+        desc,
+        url,
+        app_type,
     }
 }
 

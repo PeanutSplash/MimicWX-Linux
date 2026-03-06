@@ -21,7 +21,7 @@ use axum::{
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{get, post, delete},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -98,15 +98,27 @@ pub fn spawn_input_actor(
         info!("🎮 InputEngine actor 已启动");
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                InputCommand::SendMessage { to, text, at, skip_verify, reply } => {
+                InputCommand::SendMessage {
+                    to,
+                    text,
+                    at,
+                    skip_verify,
+                    reply,
+                } => {
                     // 自动恢复: 独立窗口失效时尝试重建
                     if !wechat.check_listen_window(&to).await {
                         wechat.try_recover_listen_window(&mut engine, &to).await;
                     }
-                    let result = wechat.send_message(&mut engine, &to, &text, &at, skip_verify).await;
+                    let result = wechat
+                        .send_message(&mut engine, &to, &text, &at, skip_verify)
+                        .await;
                     let _ = reply.send(result);
                 }
-                InputCommand::SendImage { to, image_path, reply } => {
+                InputCommand::SendImage {
+                    to,
+                    image_path,
+                    reply,
+                } => {
                     // 自动恢复: 独立窗口失效时尝试重建
                     if !wechat.check_listen_window(&to).await {
                         wechat.try_recover_listen_window(&mut engine, &to).await;
@@ -183,10 +195,16 @@ struct ApiError {
 
 impl ApiError {
     fn unavailable(msg: impl Into<String>) -> Self {
-        Self { status: StatusCode::SERVICE_UNAVAILABLE, message: msg.into() }
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: msg.into(),
+        }
     }
     fn internal(msg: impl Into<String>) -> Self {
-        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: msg.into() }
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: msg.into(),
+        }
     }
 }
 
@@ -347,24 +365,37 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
     let db_available = state.db.is_some();
     let contacts = if let Some(ref d) = state.db {
         d.get_contacts().await.len()
-    } else { 0 };
+    } else {
+        0
+    };
     let uptime_secs = state.start_time.elapsed().as_secs();
     Json(StatusResponse {
         status: status.to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
-        listen_count, db_available, contacts, uptime_secs,
+        listen_count,
+        db_available,
+        contacts,
+        uptime_secs,
     })
 }
 
 /// 联系人列表 (从数据库)
 async fn get_contacts(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
-    let db = state.db.as_ref().ok_or_else(|| ApiError::unavailable("数据库不可用"))?;
+    let db = state
+        .db
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("数据库不可用"))?;
     let contacts = db.get_contacts().await;
     Ok(Json(serde_json::json!({ "contacts": contacts })))
 }
 
-async fn get_new_messages(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
-    let db = state.db.as_ref().ok_or_else(|| ApiError::unavailable("数据库不可用"))?;
+async fn get_new_messages(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let db = state
+        .db
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("数据库不可用"))?;
     match db.get_new_messages().await {
         Ok(msgs) => Ok(Json(serde_json::to_value(msgs).unwrap_or_default())),
         Err(e) => Err(ApiError::internal(format!("消息查询失败: {e}"))),
@@ -383,20 +414,28 @@ async fn send_message(
 
     // 发送命令到 actor
     let (reply_tx, reply_rx) = oneshot::channel();
-    state.input_tx.send(InputCommand::SendMessage {
-        to: req.to.clone(),
-        text: req.text.clone(),
-        at: req.at.clone(),
-        skip_verify: has_db,
-        reply: reply_tx,
-    }).await.map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
+    state
+        .input_tx
+        .send(InputCommand::SendMessage {
+            to: req.to.clone(),
+            text: req.text.clone(),
+            at: req.at.clone(),
+            skip_verify: has_db,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
 
     match reply_rx.await {
         Ok(Ok((sent, atspi_verified, message))) => {
             // DB 验证 (优先): DB 可用时用已订阅的 receiver 等待匹配
             let verified = if let Some(rx) = sent_rx {
-                state.db.as_ref().unwrap()
-                    .verify_sent(&req.text, rx).await
+                state
+                    .db
+                    .as_ref()
+                    .unwrap()
+                    .verify_sent(&req.text, rx)
+                    .await
                     .unwrap_or(atspi_verified)
             } else {
                 atspi_verified
@@ -409,7 +448,11 @@ async fn send_message(
                 "verified": verified,
             });
             let _ = state.tx.send(msg_json.to_string());
-            Ok(Json(SendResponse { sent, verified, message }))
+            Ok(Json(SendResponse {
+                sent,
+                verified,
+                message,
+            }))
         }
         Ok(Err(e)) => Err(ApiError::internal(format!("发送失败: {e}"))),
         Err(_) => Err(ApiError::internal("actor 响应通道已关闭")),
@@ -434,9 +477,15 @@ async fn send_image(
     } else {
         "png"
     };
-    let tmp_path = format!("/tmp/mimicwx_img_{}_{:04x}.{}",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
-        rand_u16(), ext);
+    let tmp_path = format!(
+        "/tmp/mimicwx_img_{}_{:04x}.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        rand_u16(),
+        ext
+    );
     {
         let mut f = std::fs::File::create(&tmp_path)
             .map_err(|e| ApiError::internal(format!("创建临时文件失败: {e}")))?;
@@ -446,11 +495,15 @@ async fn send_image(
 
     // 发送命令到 actor
     let (reply_tx, reply_rx) = oneshot::channel();
-    state.input_tx.send(InputCommand::SendImage {
-        to: req.to.clone(),
-        image_path: tmp_path.clone(),
-        reply: reply_tx,
-    }).await.map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
+    state
+        .input_tx
+        .send(InputCommand::SendImage {
+            to: req.to.clone(),
+            image_path: tmp_path.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
 
     let result = reply_rx.await;
 
@@ -458,7 +511,11 @@ async fn send_image(
     let _ = std::fs::remove_file(&tmp_path);
 
     match result {
-        Ok(Ok((sent, verified, message))) => Ok(Json(SendResponse { sent, verified, message })),
+        Ok(Ok((sent, verified, message))) => Ok(Json(SendResponse {
+            sent,
+            verified,
+            message,
+        })),
         Ok(Err(e)) => Err(ApiError::internal(format!("发送图片失败: {e}"))),
         Err(_) => Err(ApiError::internal("actor 响应通道已关闭")),
     }
@@ -484,14 +541,24 @@ async fn chat_with(
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, ApiError> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    state.input_tx.send(InputCommand::ChatWith {
-        who: req.who.clone(),
-        reply: reply_tx,
-    }).await.map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
+    state
+        .input_tx
+        .send(InputCommand::ChatWith {
+            who: req.who.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
 
     match reply_rx.await {
-        Ok(Ok(Some(name))) => Ok(Json(ChatResponse { success: true, chat_name: Some(name) })),
-        Ok(Ok(None)) => Ok(Json(ChatResponse { success: false, chat_name: None })),
+        Ok(Ok(Some(name))) => Ok(Json(ChatResponse {
+            success: true,
+            chat_name: Some(name),
+        })),
+        Ok(Ok(None)) => Ok(Json(ChatResponse {
+            success: false,
+            chat_name: None,
+        })),
         Ok(Err(e)) => Err(ApiError::internal(format!("切换聊天失败: {e}"))),
         Err(_) => Err(ApiError::internal("actor 响应通道已关闭")),
     }
@@ -502,10 +569,14 @@ async fn add_listen(
     Json(req): Json<ListenRequest>,
 ) -> Result<Json<ListenResponse>, ApiError> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    state.input_tx.send(InputCommand::AddListen {
-        who: req.who.clone(),
-        reply: reply_tx,
-    }).await.map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
+    state
+        .input_tx
+        .send(InputCommand::AddListen {
+            who: req.who.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
 
     match reply_rx.await {
         Ok(Ok(true)) => Ok(Json(ListenResponse {
@@ -526,10 +597,13 @@ async fn remove_listen(
     Json(req): Json<ListenRequest>,
 ) -> Json<ListenResponse> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sent = state.input_tx.send(InputCommand::RemoveListen {
-        who: req.who.clone(),
-        reply: reply_tx,
-    }).await;
+    let sent = state
+        .input_tx
+        .send(InputCommand::RemoveListen {
+            who: req.who.clone(),
+            reply: reply_tx,
+        })
+        .await;
 
     let removed = if sent.is_ok() {
         reply_rx.await.unwrap_or(false)
@@ -555,7 +629,8 @@ async fn get_tree(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let max_depth = params.get("depth")
+    let max_depth = params
+        .get("depth")
         .and_then(|d| d.parse::<u32>().ok())
         .unwrap_or(5)
         .min(15);
@@ -578,10 +653,7 @@ async fn get_session_tree(State(state): State<Arc<AppState>>) -> impl IntoRespon
     Json(vec![])
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
@@ -639,8 +711,16 @@ async fn exec_command(
         "status" => {
             let status = state.wechat.check_status().await;
             let listen_list = state.wechat.get_listen_list().await;
-            let db_status = if state.db.is_some() { "可用" } else { "不可用" };
-            let contacts = if let Some(ref d) = state.db { d.get_contacts().await.len() } else { 0 };
+            let db_status = if state.db.is_some() {
+                "可用"
+            } else {
+                "不可用"
+            };
+            let contacts = if let Some(ref d) = state.db {
+                d.get_contacts().await.len()
+            } else {
+                0
+            };
             let uptime = state.start_time.elapsed().as_secs();
             let h = uptime / 3600;
             let m = (uptime % 3600) / 60;
@@ -657,9 +737,7 @@ async fn exec_command(
             let _ = state.tx.send(msg.to_string());
             "📢 已发送仅@模式切换指令".to_string()
         }
-        "reload" => {
-            exec_reload(&state).await
-        }
+        "reload" => exec_reload(&state).await,
         _ if cmd.starts_with("listen ") => {
             let who = cmd.strip_prefix("listen ").unwrap().trim();
             if who.is_empty() {
@@ -719,23 +797,43 @@ async fn exec_reload(state: &AppState) -> String {
     // Diff listen 列表
     let current = state.wechat.get_listen_list().await;
     let new_list = new_config.listen.auto;
-    let to_add: Vec<_> = new_list.iter().filter(|n| !current.contains(n)).cloned().collect();
-    let to_remove: Vec<_> = current.iter().filter(|n| !new_list.contains(n)).cloned().collect();
+    let to_add: Vec<_> = new_list
+        .iter()
+        .filter(|n| !current.contains(n))
+        .cloned()
+        .collect();
+    let to_remove: Vec<_> = current
+        .iter()
+        .filter(|n| !new_list.contains(n))
+        .cloned()
+        .collect();
 
     for who in &to_remove {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if state.input_tx.send(InputCommand::RemoveListen {
-            who: who.clone(), reply: reply_tx,
-        }).await.is_ok() {
+        if state
+            .input_tx
+            .send(InputCommand::RemoveListen {
+                who: who.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .is_ok()
+        {
             let _ = reply_rx.await;
         }
         lines.push(format!("👂 移除监听: {who}"));
     }
     for who in &to_add {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if state.input_tx.send(InputCommand::AddListen {
-            who: who.clone(), reply: reply_tx,
-        }).await.is_ok() {
+        if state
+            .input_tx
+            .send(InputCommand::AddListen {
+                who: who.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .is_ok()
+        {
             match reply_rx.await {
                 Ok(Ok(true)) => lines.push(format!("✅ 添加监听: {who}")),
                 _ => lines.push(format!("⚠️ 添加失败: {who}")),
@@ -755,9 +853,15 @@ async fn exec_reload(state: &AppState) -> String {
 /// 执行 listen 命令
 async fn exec_listen(state: &AppState, who: &str) -> String {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if state.input_tx.send(InputCommand::AddListen {
-        who: who.to_string(), reply: reply_tx,
-    }).await.is_err() {
+    if state
+        .input_tx
+        .send(InputCommand::AddListen {
+            who: who.to_string(),
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
         return "⚠️ InputEngine 不可用".to_string();
     }
     match reply_rx.await {
@@ -765,7 +869,9 @@ async fn exec_listen(state: &AppState, who: &str) -> String {
             // 持久化
             if let Some(ref path) = state.config_path {
                 let mut list = state.wechat.get_listen_list().await;
-                if !list.contains(&who.to_string()) { list.push(who.to_string()); }
+                if !list.contains(&who.to_string()) {
+                    list.push(who.to_string());
+                }
                 crate::save_listen_list(path, &list);
             }
             format!("✅ 监听已添加: {who}")
@@ -779,9 +885,15 @@ async fn exec_listen(state: &AppState, who: &str) -> String {
 /// 执行 unlisten 命令
 async fn exec_unlisten(state: &AppState, who: &str) -> String {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if state.input_tx.send(InputCommand::RemoveListen {
-        who: who.to_string(), reply: reply_tx,
-    }).await.is_err() {
+    if state
+        .input_tx
+        .send(InputCommand::RemoveListen {
+            who: who.to_string(),
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
         return "⚠️ InputEngine 不可用".to_string();
     }
     match reply_rx.await {
@@ -803,11 +915,18 @@ async fn exec_unlisten(state: &AppState, who: &str) -> String {
 async fn exec_send(state: &AppState, to: &str, text: &str) -> String {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let has_db = state.db.is_some();
-    if state.input_tx.send(InputCommand::SendMessage {
-        to: to.to_string(), text: text.to_string(),
-        at: vec![], skip_verify: has_db,
-        reply: reply_tx,
-    }).await.is_err() {
+    if state
+        .input_tx
+        .send(InputCommand::SendMessage {
+            to: to.to_string(),
+            text: text.to_string(),
+            at: vec![],
+            skip_verify: has_db,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
         return "⚠️ InputEngine 不可用".to_string();
     }
     match reply_rx.await {

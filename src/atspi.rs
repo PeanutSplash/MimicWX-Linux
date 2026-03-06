@@ -88,7 +88,9 @@ impl AtSpi {
         let a11y = atspi::AccessibilityConnection::new().await?;
         let conn = a11y.connection().clone();
         info!("🔗 AT-SPI2 连接就绪 (标准发现, 等待应用注册)");
-        Ok(Self { conn: RwLock::new(conn) })
+        Ok(Self {
+            conn: RwLock::new(conn),
+        })
     }
 
     /// 尝试所有连接方式，返回第一个有应用注册的连接
@@ -112,7 +114,9 @@ impl AtSpi {
         // 方法3: 标准 AccessibilityConnection
         if let Ok(a11y) = atspi::AccessibilityConnection::new().await {
             let conn = a11y.connection().clone();
-            let instance = Self { conn: RwLock::new(conn) };
+            let instance = Self {
+                conn: RwLock::new(conn),
+            };
             if let Some(root) = Self::registry() {
                 let count = instance.child_count(&root).await;
                 if count > 1 {
@@ -155,7 +159,9 @@ impl AtSpi {
                 "GetAddress",
                 &(),
             ),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 debug!("org.a11y.Bus.GetAddress 调用失败: {e}");
@@ -199,10 +205,7 @@ impl AtSpi {
             }
         };
 
-        let conn = match zbus::connection::Builder::unix_stream(stream)
-            .build()
-            .await
-        {
+        let conn = match zbus::connection::Builder::unix_stream(stream).build().await {
             Ok(c) => c,
             Err(e) => {
                 debug!("  zbus 连接失败: {e}");
@@ -210,7 +213,9 @@ impl AtSpi {
             }
         };
 
-        let instance = Self { conn: RwLock::new(conn) };
+        let instance = Self {
+            conn: RwLock::new(conn),
+        };
         if let Some(root) = Self::registry() {
             let count = instance.child_count(&root).await;
             debug!("  bus {socket_path} 有 {count} 个子节点");
@@ -236,7 +241,9 @@ impl AtSpi {
             let new_inner = new_conn.conn.read().await.clone();
             // 验证新连接有应用
             if let Some(root) = Self::registry() {
-                let tmp = Self { conn: RwLock::new(new_inner.clone()) };
+                let tmp = Self {
+                    conn: RwLock::new(new_inner.clone()),
+                };
                 let count = tmp.child_count(&root).await;
                 if count > 0 {
                     let mut conn = self.conn.write().await;
@@ -293,10 +300,7 @@ impl AtSpi {
                 }
             };
 
-            let conn = match zbus::connection::Builder::unix_stream(stream)
-                .build()
-                .await
-            {
+            let conn = match zbus::connection::Builder::unix_stream(stream).build().await {
                 Ok(c) => c,
                 Err(e) => {
                     debug!("  zbus 连接失败: {e}");
@@ -304,7 +308,9 @@ impl AtSpi {
                 }
             };
 
-            let instance = Self { conn: RwLock::new(conn) };
+            let instance = Self {
+                conn: RwLock::new(conn),
+            };
             if let Some(root) = Self::registry() {
                 let count = instance.child_count(&root).await;
                 if count > 1 {
@@ -330,81 +336,129 @@ impl AtSpi {
     // =================================================================
 
     pub async fn child_count(&self, node: &NodeRef) -> i32 {
-        let reply = self.call(
-            &node.bus, node.path.as_str(), Some(PROPS), "Get",
-            &(IFACE_ACCESSIBLE, "ChildCount"),
-        ).await;
-        reply.and_then(|r| {
-            let v: OwnedValue = r.body().deserialize().ok()?;
-            i32::try_from(&v).ok()
-                .or_else(|| u32::try_from(&v).ok().map(|n| n as i32))
-        }).unwrap_or(0)
+        let reply = self
+            .call(
+                &node.bus,
+                node.path.as_str(),
+                Some(PROPS),
+                "Get",
+                &(IFACE_ACCESSIBLE, "ChildCount"),
+            )
+            .await;
+        reply
+            .and_then(|r| {
+                let v: OwnedValue = r.body().deserialize().ok()?;
+                i32::try_from(&v)
+                    .ok()
+                    .or_else(|| u32::try_from(&v).ok().map(|n| n as i32))
+            })
+            .unwrap_or(0)
     }
 
     pub async fn child_at(&self, node: &NodeRef, idx: i32) -> Option<NodeRef> {
-        let reply = self.call(
-            &node.bus, node.path.as_str(),
-            Some(IFACE_ACCESSIBLE), "GetChildAtIndex", &(idx,),
-        ).await?;
+        let reply = self
+            .call(
+                &node.bus,
+                node.path.as_str(),
+                Some(IFACE_ACCESSIBLE),
+                "GetChildAtIndex",
+                &(idx,),
+            )
+            .await?;
         let (bus, path): (String, OwnedObjectPath) = reply.body().deserialize().ok()?;
         Some(NodeRef { bus, path })
     }
 
     pub async fn name(&self, node: &NodeRef) -> String {
-        let reply = self.call(
-            &node.bus, node.path.as_str(), Some(PROPS), "Get",
-            &(IFACE_ACCESSIBLE, "Name"),
-        ).await;
-        reply.and_then(|r| {
-            let v: OwnedValue = r.body().deserialize().ok()?;
-            String::try_from(v).ok()
-        }).unwrap_or_default()
+        let reply = self
+            .call(
+                &node.bus,
+                node.path.as_str(),
+                Some(PROPS),
+                "Get",
+                &(IFACE_ACCESSIBLE, "Name"),
+            )
+            .await;
+        reply
+            .and_then(|r| {
+                let v: OwnedValue = r.body().deserialize().ok()?;
+                String::try_from(v).ok()
+            })
+            .unwrap_or_default()
     }
 
     pub async fn role(&self, node: &NodeRef) -> String {
-        let reply = self.call(
-            &node.bus, node.path.as_str(),
-            Some(IFACE_ACCESSIBLE), "GetRoleName", &(),
-        ).await;
-        reply.and_then(|r| r.body().deserialize::<String>().ok())
+        let reply = self
+            .call(
+                &node.bus,
+                node.path.as_str(),
+                Some(IFACE_ACCESSIBLE),
+                "GetRoleName",
+                &(),
+            )
+            .await;
+        reply
+            .and_then(|r| r.body().deserialize::<String>().ok())
             .unwrap_or_default()
     }
 
     pub async fn bbox(&self, node: &NodeRef) -> Option<BBox> {
-        let reply = self.call(
-            &node.bus, node.path.as_str(),
-            Some(IFACE_COMPONENT), "GetExtents", &(0u32,),
-        ).await?;
+        let reply = self
+            .call(
+                &node.bus,
+                node.path.as_str(),
+                Some(IFACE_COMPONENT),
+                "GetExtents",
+                &(0u32,),
+            )
+            .await?;
         let (x, y, w, h): (i32, i32, i32, i32) = reply.body().deserialize().ok()?;
         Some(BBox { x, y, w, h })
     }
 
     pub async fn text(&self, node: &NodeRef) -> Option<String> {
-        let reply = self.call(
-            &node.bus, node.path.as_str(),
-            Some(IFACE_TEXT), "GetText", &(0i32, -1i32),
-        ).await?;
+        let reply = self
+            .call(
+                &node.bus,
+                node.path.as_str(),
+                Some(IFACE_TEXT),
+                "GetText",
+                &(0i32, -1i32),
+            )
+            .await?;
         reply.body().deserialize::<String>().ok()
     }
 
     /// 读取 Description 属性
     pub async fn description(&self, node: &NodeRef) -> String {
-        let reply = self.call(
-            &node.bus, node.path.as_str(), Some(PROPS), "Get",
-            &(IFACE_ACCESSIBLE, "Description"),
-        ).await;
-        reply.and_then(|r| {
-            let v: OwnedValue = r.body().deserialize().ok()?;
-            String::try_from(v).ok()
-        }).unwrap_or_default()
+        let reply = self
+            .call(
+                &node.bus,
+                node.path.as_str(),
+                Some(PROPS),
+                "Get",
+                &(IFACE_ACCESSIBLE, "Description"),
+            )
+            .await;
+        reply
+            .and_then(|r| {
+                let v: OwnedValue = r.body().deserialize().ok()?;
+                String::try_from(v).ok()
+            })
+            .unwrap_or_default()
     }
 
     /// 获取 Parent 节点
     pub async fn parent(&self, node: &NodeRef) -> Option<NodeRef> {
-        let reply = self.call(
-            &node.bus, node.path.as_str(), Some(PROPS), "Get",
-            &(IFACE_ACCESSIBLE, "Parent"),
-        ).await?;
+        let reply = self
+            .call(
+                &node.bus,
+                node.path.as_str(),
+                Some(PROPS),
+                "Get",
+                &(IFACE_ACCESSIBLE, "Parent"),
+            )
+            .await?;
         let v: OwnedValue = reply.body().deserialize().ok()?;
         let (bus, path): (String, OwnedObjectPath) = zbus::zvariant::Value::try_from(v)
             .ok()
@@ -415,20 +469,27 @@ impl AtSpi {
     /// 获取节点状态位集合 (AT-SPI2 StateSet)
     /// 返回 64 位状态标志 (两个 u32 合并)
     pub async fn get_states(&self, node: &NodeRef) -> u64 {
-        let reply = self.call(
-            &node.bus, node.path.as_str(),
-            Some(IFACE_ACCESSIBLE), "GetState", &(),
-        ).await;
-        reply.and_then(|r| {
-            let states: Vec<u32> = r.body().deserialize().ok()?;
-            if states.len() >= 2 {
-                Some((states[1] as u64) << 32 | states[0] as u64)
-            } else if states.len() == 1 {
-                Some(states[0] as u64)
-            } else {
-                None
-            }
-        }).unwrap_or(0)
+        let reply = self
+            .call(
+                &node.bus,
+                node.path.as_str(),
+                Some(IFACE_ACCESSIBLE),
+                "GetState",
+                &(),
+            )
+            .await;
+        reply
+            .and_then(|r| {
+                let states: Vec<u32> = r.body().deserialize().ok()?;
+                if states.len() >= 2 {
+                    Some((states[1] as u64) << 32 | states[0] as u64)
+                } else if states.len() == 1 {
+                    Some(states[0] as u64)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
     }
 
     /// 检查节点是否处于 SELECTED 状态 (AT-SPI2 STATE_SELECTED = bit 25)
@@ -439,11 +500,18 @@ impl AtSpi {
 
     /// 强制聚焦节点 (将窗口提到前台)
     pub async fn grab_focus(&self, node: &NodeRef) -> bool {
-        let reply = self.call(
-            &node.bus, node.path.as_str(),
-            Some(IFACE_COMPONENT), "GrabFocus", &(),
-        ).await;
-        reply.and_then(|r| r.body().deserialize::<bool>().ok()).unwrap_or(false)
+        let reply = self
+            .call(
+                &node.bus,
+                node.path.as_str(),
+                Some(IFACE_COMPONENT),
+                "GrabFocus",
+                &(),
+            )
+            .await;
+        reply
+            .and_then(|r| r.body().deserialize::<bool>().ok())
+            .unwrap_or(false)
     }
 
     // =================================================================
@@ -454,7 +522,8 @@ impl AtSpi {
     ///
     /// `matcher(role, name) -> bool`: 返回 true 表示匹配
     pub async fn find_bfs(
-        &self, root: &NodeRef,
+        &self,
+        root: &NodeRef,
         matcher: impl Fn(&str, &str) -> bool,
     ) -> Option<NodeRef> {
         self.find_bfs_limited(root, &matcher, 500).await
@@ -462,7 +531,8 @@ impl AtSpi {
 
     /// BFS 查找节点 — 带节点数量上限
     pub async fn find_bfs_limited(
-        &self, root: &NodeRef,
+        &self,
+        root: &NodeRef,
         matcher: &impl Fn(&str, &str) -> bool,
         max_nodes: usize,
     ) -> Option<NodeRef> {
@@ -470,14 +540,18 @@ impl AtSpi {
         let mut visited = 0usize;
 
         for _depth in 0..20 {
-            if frontier.is_empty() { return None; }
+            if frontier.is_empty() {
+                return None;
+            }
             let mut next = Vec::new();
 
             for node in &frontier {
                 let count = self.child_count(node).await;
                 for i in 0..count.min(20) {
                     visited += 1;
-                    if visited > max_nodes { return None; }
+                    if visited > max_nodes {
+                        return None;
+                    }
                     if let Some(child) = self.child_at(node, i).await {
                         let role = self.role(&child).await;
                         let name = self.name(&child).await;
@@ -502,12 +576,17 @@ impl AtSpi {
     /// - `Recurse` = 不匹配, 但继续递归子节点
     /// - `Skip` = 不匹配, 跳过此子树
     pub fn find_dfs<'a>(
-        &'a self, node: &'a NodeRef,
+        &'a self,
+        node: &'a NodeRef,
         matcher: &'a (dyn Fn(&str, &str) -> SearchAction + Send + Sync),
-        depth: u32, max_depth: u32, max_children: i32,
+        depth: u32,
+        max_depth: u32,
+        max_children: i32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<NodeRef>> + Send + 'a>> {
         Box::pin(async move {
-            if depth > max_depth { return None; }
+            if depth > max_depth {
+                return None;
+            }
 
             let count = self.child_count(node).await;
             for i in 0..count.min(max_children) {
@@ -517,9 +596,10 @@ impl AtSpi {
                     match matcher(&role, &name) {
                         SearchAction::Found => return Some(child),
                         SearchAction::Recurse => {
-                            if let Some(found) = self.find_dfs(
-                                &child, matcher, depth + 1, max_depth, max_children,
-                            ).await {
+                            if let Some(found) = self
+                                .find_dfs(&child, matcher, depth + 1, max_depth, max_children)
+                                .await
+                            {
                                 return Some(found);
                             }
                         }
@@ -539,23 +619,35 @@ impl AtSpi {
     pub async fn dump_tree(&self, root: &NodeRef, max_depth: u32) -> Vec<TreeNode> {
         let mut nodes = Vec::new();
         let mut count = 0u32;
-        self.dump_dfs(root, 0, max_depth, &mut nodes, &mut count).await;
+        self.dump_dfs(root, 0, max_depth, &mut nodes, &mut count)
+            .await;
         nodes
     }
 
     fn dump_dfs<'a>(
-        &'a self, node: &'a NodeRef, depth: u32, max_depth: u32,
-        out: &'a mut Vec<TreeNode>, count: &'a mut u32,
+        &'a self,
+        node: &'a NodeRef,
+        depth: u32,
+        max_depth: u32,
+        out: &'a mut Vec<TreeNode>,
+        count: &'a mut u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            if depth > max_depth || *count >= 200 { return; }
+            if depth > max_depth || *count >= 200 {
+                return;
+            }
             *count += 1;
 
             let role = self.role(node).await;
             let name = self.name(node).await;
             let children = self.child_count(node).await;
 
-            out.push(TreeNode { depth, role: role.clone(), name: name.clone(), children });
+            out.push(TreeNode {
+                depth,
+                role: role.clone(),
+                name: name.clone(),
+                children,
+            });
 
             // 消息列表不递归
             if role == "list" && (name.contains("消息") || name.contains("Messages")) {
@@ -563,9 +655,12 @@ impl AtSpi {
             }
 
             for i in 0..children.min(20) {
-                if *count >= 200 { return; }
+                if *count >= 200 {
+                    return;
+                }
                 if let Some(child) = self.child_at(node, i).await {
-                    self.dump_dfs(&child, depth + 1, max_depth, out, count).await;
+                    self.dump_dfs(&child, depth + 1, max_depth, out, count)
+                        .await;
                 }
             }
         })
@@ -576,18 +671,29 @@ impl AtSpi {
     // =================================================================
 
     async fn call(
-        &self, bus: &str, path: &str,
-        iface: Option<&str>, method: &str,
+        &self,
+        bus: &str,
+        path: &str,
+        iface: Option<&str>,
+        method: &str,
         body: &(impl serde::Serialize + zbus::zvariant::DynamicType + Sync),
     ) -> Option<zbus::Message> {
         let conn = self.conn.read().await;
         match tokio::time::timeout(
             CALL_TIMEOUT,
             conn.call_method(Some(bus), path, iface, method, body),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(reply)) => Some(reply),
-            Ok(Err(e)) => { debug!("D-Bus {method}: {e}"); None }
-            Err(_) => { debug!("D-Bus {method}: timeout"); None }
+            Ok(Err(e)) => {
+                debug!("D-Bus {method}: {e}");
+                None
+            }
+            Err(_) => {
+                debug!("D-Bus {method}: timeout");
+                None
+            }
         }
     }
 }
@@ -609,10 +715,21 @@ pub enum SearchAction {
 /// 结构性角色: BFS 搜索时应当穿透的容器节点
 /// 统一定义, 避免多处硬编码不一致
 pub fn is_structural_role(role: &str) -> bool {
-    matches!(role,
-        "filler" | "layered pane" | "panel" | "frame"
-        | "scroll pane" | "viewport" | "section"
-        | "split pane" | "splitter" | "page tab list"
-        | "page tab" | "tool bar" | "" | "invalid"
+    matches!(
+        role,
+        "filler"
+            | "layered pane"
+            | "panel"
+            | "frame"
+            | "scroll pane"
+            | "viewport"
+            | "section"
+            | "split pane"
+            | "splitter"
+            | "page tab list"
+            | "page tab"
+            | "tool bar"
+            | ""
+            | "invalid"
     )
 }
