@@ -85,6 +85,7 @@ impl RuntimeManager {
         self.tx.subscribe()
     }
 
+    #[allow(dead_code)]
     pub async fn current(&self) -> RuntimeState {
         self.current.read().await.clone()
     }

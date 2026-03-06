@@ -7,6 +7,7 @@ use crate::api::InputCommand;
 use crate::db::{DbManager, DbMessage};
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[allow(dead_code)]
 pub struct SendResult {
     pub sent: bool,
     pub verified: bool,
@@ -20,18 +21,21 @@ pub trait KeyProvider: Send + Sync {
 }
 
 #[async_trait::async_trait]
+#[allow(dead_code)]
 pub trait MessageSource: Send + Sync {
     async fn get_new_messages(&self) -> Result<Vec<DbMessage>>;
     fn spawn_watcher(&self) -> broadcast::Receiver<()>;
 }
 
 #[async_trait::async_trait]
+#[allow(dead_code)]
 pub trait MessageSender: Send + Sync {
     async fn send_message(&self, to: &str, text: &str, at: &[String]) -> Result<SendResult>;
     async fn send_image(&self, to: &str, image_path: &str) -> Result<SendResult>;
 }
 
 #[async_trait::async_trait]
+#[allow(dead_code)]
 pub trait SessionLocator: Send + Sync {
     async fn chat_with(&self, who: &str) -> Result<Option<String>>;
     async fn add_listen(&self, who: &str) -> Result<bool>;
@@ -80,6 +84,7 @@ impl MessageSource for Arc<DbManager> {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct ActorPort {
     tx: mpsc::Sender<InputCommand>,
 }

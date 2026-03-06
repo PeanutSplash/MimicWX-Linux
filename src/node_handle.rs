@@ -1,6 +1,7 @@
 use crate::atspi::{AtSpi, NodeRef};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum NameMatch {
     Any,
     Exact(String),
