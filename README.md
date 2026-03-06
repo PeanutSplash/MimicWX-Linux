@@ -11,12 +11,14 @@
 - 🔍 **数据库消息检测** — SQLCipher 解密 WCDB + fanotify WAL 实时监听，亚秒级延迟，支持文本/图片/语音/视频/链接等 13+ 种消息类型解析
 - ⌨️ **X11 原生输入注入** — XTEST 扩展注入键鼠事件 + X11 Selection 协议直接操作剪贴板（零外部进程依赖），原生窗口管理
 - 🔑 **GDB 自动密钥提取** — 在 `setCipherKey` 偏移处设断点，扫码登录后自动从寄存器捕获 32 字节 AES 密钥
-- 💬 **独立聊天窗口** — 借鉴 [wxauto](https://github.com/cluic/wxauto) 的 ChatWnd 设计，支持多窗口并行收发 + 缓存节点自动失效重建
-- 🔌 **REST + WebSocket API** — 完整 HTTP API + WebSocket 实时推送 (30s 心跳保活)，CORS 全开放，可对接 Yunzai 等机器人框架
-- 🐳 **Docker 一键部署** — 多阶段构建 + Xvfb/VNC 虚拟桌面，开箱即用
+- 💬 **独立聊天窗口** — 借鉴 [wxauto](https://github.com/cluic/wxauto) 的 ChatWnd 设计，支持多窗口并行收发 + NodeHandle 缓存自动失效重建
+- 🔌 **REST + JSON-RPC over WebSocket** — 完整 HTTP API + WebSocket 双向通信（JSON-RPC 2.0 请求/响应 + 实时事件推送），CORS 全开放，可对接 Yunzai 等机器人框架
+- 🐳 **Docker 一键部署** — 多阶段构建，默认 headless 运行（Xvfb + openbox），可选 VNC debug 模式
 - 🔒 **Token 认证** — 支持 Bearer Token 认证保护 API 安全
 - 🖥️ **交互式控制台** — 支持 `/restart`、`/stop`、`/status`、`/refresh`、`/help` 命令，方向键切换历史
 - 💡 **自动弹性** — AT-SPI2 心跳自动重连、联系人定时刷新、优雅重启/关闭
+- 🔄 **运行时状态机** — 显式 RuntimeState（Booting → DesktopReady → WeChatReady → LoginWaiting → KeyReady → DbReady → Serving），异常进入 Degraded 而非 panic
+- 📊 **输入层可观测** — 队列深度、命令耗时、剪贴板失败、焦点丢失等关键指标实时暴露
 
 ---
 
@@ -25,35 +27,44 @@
 ```
 ┌─ Docker 容器 (Ubuntu 22.04) ──────────────────────────────────────────────┐
 │                                                                           │
-│  ┌─ 桌面环境 ────────────────────────────────────────────────────────────┐ │
-│  │  Xvfb (虚拟显示 :1)  ←→  TigerVNC  ←→  noVNC (浏览器远程桌面)      │ │
-│  │  XFCE4 桌面  +  WeChat Linux 版                                     │ │
-│  └──────────────────────────────────────────────────────────────────────┘ │
+│  ┌─ 显示层 ───────────────────────────────────────────────────────────────┐│
+│  │  默认: Xvfb (虚拟显示 :1) + openbox (轻量 WM)  ← headless 模式      ││
+│  │  调试: MIMICWX_DEBUG=1 → TigerVNC + noVNC (浏览器远程桌面)           ││
+│  │  WeChat Linux 版                                                      ││
+│  └───────────────────────────────────────────────────────────────────────┘│
 │                                                                           │
 │  ┌─ MimicWX 核心 (Rust) ────────────────────────────────────────────────┐ │
 │  │                                                                       │ │
-│  │  ┌── 消息检测层 ──────────────────────────────────────────────────┐   │ │
-│  │  │  db.rs:    SQLCipher 解密 → fanotify WAL 监听 → 增量消息拉取  │   │ │
-│  │  │  atspi.rs: D-Bus → AT-SPI2 Registry → 节点遍历/属性读取       │   │ │
-│  │  └────────────────────────────────────────────────────────────────┘   │ │
+│  │  ┌── 运行时层 ──────────────────────────────────────────────────┐     │ │
+│  │  │  runtime.rs: RuntimeState 状态机驱动启动 + 广播状态变更       │     │ │
+│  │  │  ports.rs:   Ports/Adapters 抽象 (KeyProvider / MessageSource │     │ │
+│  │  │              / MessageSender / SessionLocator)                │     │ │
+│  │  └──────────────────────────────────────────────────────────────┘     │ │
 │  │                                                                       │ │
-│  │  ┌── 输入控制层 ──────────────────────────────────────────────────┐   │ │
-│  │  │  input.rs: X11 XTEST 键鼠注入 + X11 Selection 剪贴板 + 窗口管理│   │ │
-│  │  └────────────────────────────────────────────────────────────────┘   │ │
+│  │  ┌── 消息检测层 ────────────────────────────────────────────────┐     │ │
+│  │  │  db.rs:    SQLCipher 解密 → fanotify WAL 监听 → 增量消息拉取 │     │ │
+│  │  │  atspi.rs: D-Bus → AT-SPI2 Registry → 节点遍历/属性读取      │     │ │
+│  │  └──────────────────────────────────────────────────────────────┘     │ │
 │  │                                                                       │ │
-│  │  ┌── 业务逻辑层 ──────────────────────────────────────────────────┐   │ │
-│  │  │  wechat.rs:  会话管理 / 消息发送 / 控件查找 / 状态检测         │   │ │
-│  │  │  chatwnd.rs: 独立聊天窗口管理 (多窗口并行)                     │   │ │
-│  │  └────────────────────────────────────────────────────────────────┘   │ │
+│  │  ┌── 输入控制层 ────────────────────────────────────────────────┐     │ │
+│  │  │  input.rs:       X11 XTEST 键鼠注入 + X11 Selection 剪贴板   │     │ │
+│  │  │  node_handle.rs: AT-SPI 节点指纹 + 缓存失效自动重定位        │     │ │
+│  │  └──────────────────────────────────────────────────────────────┘     │ │
 │  │                                                                       │ │
-│  │  ┌── API 层 ──────────────────────────────────────────────────────┐   │ │
-│  │  │  api.rs: axum HTTP + WebSocket (CORS + 心跳保活)                │   │ │
-│  │  │  main.rs: 启动编排 / 配置 / 消息循环 / 交互式控制台             │   │ │
-│  │  └────────────────────────────────────────────────────────────────┘   │ │
+│  │  ┌── 业务逻辑层 ────────────────────────────────────────────────┐     │ │
+│  │  │  wechat.rs:  会话管理 / 消息发送 / 控件查找 / 状态检测        │     │ │
+│  │  │  chatwnd.rs: 独立聊天窗口管理 (多窗口并行)                    │     │ │
+│  │  └──────────────────────────────────────────────────────────────┘     │ │
+│  │                                                                       │ │
+│  │  ┌── API 层 ────────────────────────────────────────────────────┐     │ │
+│  │  │  api.rs:    axum HTTP + WebSocket (JSON-RPC 2.0 + 心跳保活)   │     │ │
+│  │  │  events.rs: WxEvent 类型化事件 (Message/Sent/StatusChange)    │     │ │
+│  │  │  main.rs:   状态机驱动启动 / 配置 / 消息循环 / 交互式控制台    │     │ │
+│  │  └──────────────────────────────────────────────────────────────┘     │ │
 │  └───────────────────────────────────────────────────────────────────────┘ │
 │                                                                           │
 │  ┌─ 辅助脚本 ────────────────────────────────────────────────────────────┐ │
-│  │  start.sh:       容器启动编排 (D-Bus → VNC → AT-SPI2 → 微信 → 服务) │ │
+│  │  start.sh:       容器启动编排 (D-Bus → X11 → AT-SPI2 → 微信 → 服务) │ │
 │  │  extract_key.py: GDB Python 脚本 — 自动提取 WCDB 加密密钥          │ │
 │  └──────────────────────────────────────────────────────────────────────┘ │
 └───────────────────────────────────────────────────────────────────────────┘
@@ -70,15 +81,19 @@
 ```
 MimicWX-Linux/
 ├── src/                        # Rust 源代码
-│   ├── main.rs                 # 入口: 启动编排、配置加载、消息循环
+│   ├── main.rs                 # 入口: 状态机驱动启动、配置加载、消息循环
+│   ├── runtime.rs              # 运行时状态机 (RuntimeState 枚举 + RuntimeManager)
+│   ├── ports.rs                # Ports/Adapters 抽象 (trait 定义 + 适配器实现)
+│   ├── events.rs               # 类型化事件 (WxEvent 枚举 + JSON-RPC 序列化)
 │   ├── atspi.rs                # AT-SPI2 底层原语 (D-Bus 通信、节点遍历)
 │   ├── input.rs                # X11 XTEST 输入引擎 (键鼠注入、窗口管理)
+│   ├── node_handle.rs          # AT-SPI 节点句柄 (指纹匹配 + 缓存失效重定位)
 │   ├── wechat.rs               # 微信业务逻辑 (会话管理、消息发送/验证)
 │   ├── chatwnd.rs              # 独立聊天窗口 (ChatWnd 模式)
 │   ├── db.rs                   # 数据库监听 (SQLCipher + fanotify WAL)
-│   └── api.rs                  # HTTP/WebSocket API (axum)
+│   └── api.rs                  # HTTP/WebSocket API (axum + JSON-RPC 2.0)
 ├── docker/
-│   ├── start.sh                # 容器启动脚本
+│   ├── start.sh                # 容器启动脚本 (headless/debug 双模式)
 │   ├── extract_key.py          # GDB 密钥提取脚本
 │   └── dbus-mimicwx.conf       # D-Bus 配置 (允许 eavesdrop)
 ├── adapter/
@@ -92,6 +107,56 @@ MimicWX-Linux/
 ---
 
 ## 📦 核心模块详解
+
+### `runtime.rs` — 运行时状态机
+
+显式定义系统生命周期，每个阶段有明确的前置条件和退出条件：
+
+| 状态 | 说明 |
+|------|------|
+| `Booting` | 系统服务启动中 |
+| `DesktopReady` | X11 + AT-SPI2 连接就绪 |
+| `WeChatReady` | 微信进程已启动，窗口可见 |
+| `LoginWaiting` | 等待扫码登录 |
+| `KeyReady` | GDB 密钥提取成功 |
+| `DbReady` | DbManager 初始化完成，联系人已加载 |
+| `Serving` | 全功能服务中 |
+| `Degraded(reason)` | 部分功能不可用（附原因） |
+
+状态变更通过 broadcast channel 通知 API 层，`/status` 返回精确的 RuntimeState。
+
+### `ports.rs` — Ports/Adapters 抽象
+
+定义业务边界 trait，将基础设施与业务逻辑解耦：
+
+| Port (trait) | Adapter (实现) | 职责 |
+|-------------|---------------|------|
+| `KeyProvider` | `GdbFileKeyProvider` | 读取 GDB 提取的密钥文件 |
+| `MessageSource` | `WcdbMessageSource` (db.rs) | 数据库增量消息 + fanotify 监听 |
+| `MessageSender` | `ActorPort` | AT-SPI + X11 发送消息/图片 |
+| `SessionLocator` | `ActorPort` | 会话切换 / 监听管理 |
+
+### `events.rs` — 类型化事件
+
+内部事件统一为 `WxEvent` 枚举，序列化为 JSON-RPC 2.0 通知推送：
+
+| 事件类型 | 说明 |
+|---------|------|
+| `Message(DbMessage)` | 数据库新消息 |
+| `Sent { to, text, verified }` | 发送结果确认 |
+| `StatusChange { from, to }` | 运行时状态变化 |
+| `Control { cmd }` | 控制命令 |
+
+### `node_handle.rs` — AT-SPI 节点句柄
+
+统一的 NodeHandle 机制，解决 AT-SPI 节点引用散落各模块的问题：
+
+| 能力 | 说明 |
+|------|------|
+| **指纹匹配** | 通过 role + name pattern + 祖先路径定位节点 |
+| **缓存失效** | 自动检测节点失效（bbox 校验），透明重搜 |
+| **统一接口** | `resolve()` 一个方法搞定获取/重定位/失败检测 |
+| **搜索限制** | DFS 最多 600 节点，防止遍历失控 |
 
 ### `atspi.rs` — AT-SPI2 底层原语
 
@@ -116,6 +181,7 @@ MimicWX-Linux/
 | **图片发送** | `xclip -selection clipboard -t image/png` → `Ctrl+V` 粘贴 |
 | **鼠标** | 移动 / 单击 / 双击 / 右键 / 滚轮 |
 | **窗口管理** | X11 原生 `_NET_ACTIVE_WINDOW` 激活 / `_NET_CLOSE_WINDOW` 关闭 (替代 xdotool) |
+| **可观测指标** | InputMetrics 实时跟踪队列深度、命令耗时、失败计数 |
 
 ### `db.rs` — 数据库监听
 
@@ -152,16 +218,16 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 | 能力 | 说明 |
 |------|------|
 | **窗口管理** | 创建 / 存活检查 / 销毁 |
-| **缓存失效重建** | 输入框/消息列表节点使用前 bbox 校验，失效自动重搜 |
+| **NodeHandle 集成** | 输入框/消息列表通过 NodeHandle 自动管理失效重建 |
 | **消息发送** | 激活窗口 → 发送文本/图片 → 验证 |
 
 ### `api.rs` — HTTP + WebSocket API
 
-基于 `axum` 的 REST API + WebSocket 实时推送：
+基于 `axum` 的 REST API + JSON-RPC over WebSocket：
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/status` | GET | 服务状态 + DB/联系人/运行时间 (免认证) |
+| `/status` | GET | RuntimeState + InputMetrics + DB/联系人/运行时间 (免认证) |
 | `/contacts` | GET | 联系人列表 (数据库) |
 | `/sessions` | GET | 会话列表 (优先数据库) |
 | `/messages/new` | GET | 新消息 (数据库增量) |
@@ -171,11 +237,30 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 | `/listen` | POST | 添加/查看监听目标 |
 | `/listen` | DELETE | 移除监听目标 |
 | `/command` | POST | 通用命令执行 (微信互通) |
-| `/ws` | GET | WebSocket 实时消息推送 |
+| `/ws` | GET | WebSocket (JSON-RPC 2.0 双向通信 + 事件推送) |
 | `/debug/tree` | GET | AT-SPI2 控件树 (调试) |
 | `/debug/session_tree` | GET | 会话容器树 (调试) |
 
 > 认证方式: `Header "Authorization: Bearer <token>"` 或 `Query "?token=<token>"`
+
+**WebSocket JSON-RPC 2.0 支持：**
+
+适配器只需一个 WS 连接即可完成所有操作（发送命令 + 接收事件）：
+
+```json
+// 请求 (客户端 → 服务端)
+{"jsonrpc": "2.0", "method": "send", "params": {"to": "...", "text": "..."}, "id": 1}
+
+// 响应 (服务端 → 客户端)
+{"jsonrpc": "2.0", "result": {"sent": true, "verified": true}, "id": 1}
+
+// 事件推送 (服务端 → 客户端, 无 id)
+{"jsonrpc": "2.0", "method": "message", "params": {"chat": "...", "content": "..."}}
+```
+
+支持方法：`status`、`send`、`send_image`、`chat`、`listen`、`unlisten`、`contacts`、`sessions`
+
+> REST API 保持 100% 向后兼容。
 
 ---
 
@@ -199,13 +284,26 @@ docker compose up -d
 
 ```bash
 docker build -t mimicwx .
+
+# 首次部署 (需要扫码，启用 VNC debug 模式)
 docker run -d --name mimicwx \
   --cap-add SYS_ADMIN \
   --cap-add SYS_PTRACE \
   --security-opt seccomp=unconfined \
   --security-opt apparmor=unconfined \
+  -e MIMICWX_DEBUG=1 \
   -p 5901:5901 \
   -p 6080:6080 \
+  -p 8899:8899 \
+  --shm-size 512m \
+  mimicwx
+
+# 扫码完成后，切换为 headless 模式运行
+docker run -d --name mimicwx \
+  --cap-add SYS_ADMIN \
+  --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  --security-opt apparmor=unconfined \
   -p 8899:8899 \
   --shm-size 512m \
   mimicwx
@@ -213,19 +311,27 @@ docker run -d --name mimicwx \
 
 ### 首次使用
 
-1. 打开 noVNC: `http://HOST:6080/vnc.html` (密码: `mimicwx`)
-2. 在虚拟桌面中扫码登录微信
-3. GDB 自动提取数据库密钥 → MimicWX 自动启动
-4. 通过 API 接口开始使用
+1. 使用 `MIMICWX_DEBUG=1` 启动容器（启用 VNC）
+2. 打开 noVNC: `http://HOST:6080/vnc.html` (密码: `mimicwx`)
+3. 在虚拟桌面中扫码登录微信
+4. GDB 自动提取数据库密钥 → MimicWX 自动启动
+5. 通过 API 接口开始使用
+6. 后续重启可去掉 `MIMICWX_DEBUG=1`，以 headless 模式运行
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MIMICWX_DEBUG` | `0` | 设为 `1` 启用 VNC + noVNC debug 模式 |
 
 ### 访问入口
 
 | 服务 | 地址 | 说明 |
 |------|------|------|
-| noVNC | `http://HOST:6080/vnc.html` | 浏览器远程桌面 (密码: `mimicwx`) |
-| VNC | `vnc://HOST:5901` | VNC 客户端连接 |
 | API | `http://HOST:8899` | REST API 接口 |
-| WebSocket | `ws://HOST:8899/ws` | 实时消息推送 |
+| WebSocket | `ws://HOST:8899/ws` | JSON-RPC 2.0 + 实时事件推送 |
+| noVNC | `http://HOST:6080/vnc.html` | 浏览器远程桌面 (仅 `MIMICWX_DEBUG=1`) |
+| VNC | `vnc://HOST:5901` | VNC 客户端连接 (仅 `MIMICWX_DEBUG=1`) |
 
 ---
 
@@ -302,12 +408,12 @@ GDB detach → 微信正常运行 → MimicWX 读取密钥 → 解密数据库
 | 消息检测 | **SQLCipher** + **fanotify** | 数据库解密 + WAL 实时监听 |
 | UI 自动化 | **AT-SPI2** (`atspi-rs` + `zbus`) | D-Bus 无障碍接口控制 |
 | 输入注入 | **X11 XTEST** (`x11rb`) | 原生 X11 扩展 + Selection 剪贴板 |
-| API 服务 | **axum** | HTTP + WebSocket |
+| API 服务 | **axum** | HTTP + WebSocket (JSON-RPC 2.0) |
 | 序列化 | **serde** + **serde_json** | JSON 序列化/反序列化 |
 | XML 解析 | **quick-xml** | 微信消息 XML 解析 |
 | 压缩 | **zstd** | WCDB Zstd BLOB 解压 |
 | 容器化 | **Docker** (Ubuntu 22.04) | 多阶段构建 |
-| 虚拟桌面 | **TigerVNC** + **noVNC** | 远程桌面访问 |
+| 虚拟桌面 | **Xvfb** + **openbox** | 默认 headless，可选 VNC debug |
 | 密钥提取 | **GDB** + **Python** | 运行时内存断点 |
 
 ---
@@ -318,22 +424,24 @@ GDB detach → 微信正常运行 → MimicWX 读取密钥 → 解密数据库
 容器启动 (start.sh)
  ├── 0) 系统服务: D-Bus daemon + ptrace 设置 + 权限修复
  ├── 1) D-Bus session bus
- ├── 2) VNC + XFCE 桌面 (1280×720)
- ├── 3) 清理 XFCE 自启的 AT-SPI2 (避免 bus 冲突)
+ ├── 2) 显示服务:
+ │      ├─ headless 模式: Xvfb + openbox (默认)
+ │      └─ debug 模式:   VNC + XFCE (MIMICWX_DEBUG=1)
+ ├── 3) 清理冗余 AT-SPI2 (避免 bus 冲突)
  ├── 4) 启动唯一的 AT-SPI2 bus
  ├── 5) 获取 AT-SPI2 bus 地址 → 保存环境变量
  ├── 6) 启动微信 → 等待窗口就绪
  ├── GDB 密钥提取 (后台, 等待用户扫码)
- ├── 7) noVNC (websockify)
- └── 8) MimicWX 主服务
-      ├── AT-SPI2 连接 (带重试)
-      ├── X11 XTEST 输入引擎
-      ├── 等待微信登录
-      ├── 读取密钥 → DbManager 初始化
-      ├── InputEngine Actor (mpsc 队列)
-      ├── API 服务 (axum :8899)
-      ├── 数据库消息监听任务 (fanotify)
-      └── 自动监听任务 (config.toml auto)
+ ├── 7) noVNC websockify (仅 debug 模式)
+ └── 8) MimicWX 主服务 (状态机驱动)
+      ├── Booting       → AT-SPI2 连接 + X11 XTEST 输入引擎
+      ├── DesktopReady  → 等待微信进程
+      ├── WeChatReady   → 检测登录状态
+      ├── LoginWaiting  → 等待扫码
+      ├── KeyReady      → 读取 GDB 密钥
+      ├── DbReady       → DbManager 初始化 + 联系人加载
+      ├── Serving       → API 服务 + 消息监听 + 自动监听
+      └── Degraded      → 部分功能降级运行
 ```
 
 ---
@@ -369,10 +477,20 @@ curl -X POST http://localhost:8899/listen \
   -d '{"who": "好友A"}'
 ```
 
-### WebSocket 连接
+### WebSocket 连接 (JSON-RPC 2.0)
 ```javascript
 const ws = new WebSocket("ws://localhost:8899/ws?token=your-token")
+
+// 接收事件推送
 ws.onmessage = (e) => console.log(JSON.parse(e.data))
+
+// 通过 WS 发送命令 (无需额外 HTTP 请求)
+ws.send(JSON.stringify({
+  jsonrpc: "2.0",
+  method: "send",
+  params: { to: "文件传输助手", text: "Hello!" },
+  id: 1
+}))
 ```
 
 ---
@@ -406,6 +524,16 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data))
 ---
 
 ## 📋 更新日志
+
+### v0.6.0
+
+- 🔄 **运行时状态机** — 显式 RuntimeState 枚举驱动启动流程，告别散落的 sleep/文件约定
+- 🧩 **Ports/Adapters 架构** — KeyProvider / MessageSource / MessageSender / SessionLocator trait 解耦基础设施和业务
+- 📡 **JSON-RPC over WebSocket** — WS 支持双向通信，适配器只需一个连接即可完成所有操作
+- 📊 **输入层可观测化** — InputMetrics 实时跟踪队列深度、命令耗时、剪贴板/焦点失败
+- 🎯 **NodeHandle 节点稳定性** — 统一的 AT-SPI 节点指纹匹配 + 缓存失效自动重定位
+- 🐳 **Headless 默认化** — 默认 Xvfb + openbox 轻量运行，`MIMICWX_DEBUG=1` 按需启用 VNC
+- 📢 **类型化事件** — WxEvent 枚举替代裸 JSON 字符串广播，WS 推送遵循 JSON-RPC 2.0
 
 ### v0.5.1
 
