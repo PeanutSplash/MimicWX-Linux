@@ -268,61 +268,70 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 
 ### 环境要求
 
-- Linux 系统 (Ubuntu 22.04+ 推荐)
+- Linux x86_64 系统 (Ubuntu 22.04+ 推荐)，或可运行 x86_64 容器的主机
 - Docker + Docker Compose
 - 允许 `SYS_ADMIN` / `SYS_PTRACE` 能力 (密钥提取 + fanotify 需要)
 
-### 一键部署
+### 生产部署
 
 ```bash
 git clone https://github.com/PigeonCoders/MimicWX-Linux.git
 cd MimicWX-Linux
+```
+
+**首次部署（需要扫码登录微信）：**
+
+```bash
+# 启动 debug 模式容器（含 VNC 桌面）
+docker compose --profile debug up -d mimicwx-debug
+
+# 浏览器打开 noVNC 扫码登录
+# http://HOST:6080/vnc.html (密码: mimicwx)
+
+# 扫码完成、确认服务正常后，切换为 headless 模式
+docker compose --profile debug down
 docker compose up -d
 ```
 
-### 或手动 Docker 构建
+**后续启动（已登录，headless 模式）：**
 
 ```bash
-docker build -t mimicwx .
-
-# 首次部署 (需要扫码，启用 VNC debug 模式)
-docker run -d --name mimicwx \
-  --cap-add SYS_ADMIN \
-  --cap-add SYS_PTRACE \
-  --security-opt seccomp=unconfined \
-  --security-opt apparmor=unconfined \
-  -e MIMICWX_DEBUG=1 \
-  -p 5901:5901 \
-  -p 6080:6080 \
-  -p 8899:8899 \
-  --shm-size 512m \
-  mimicwx
-
-# 扫码完成后，切换为 headless 模式运行
-docker run -d --name mimicwx \
-  --cap-add SYS_ADMIN \
-  --cap-add SYS_PTRACE \
-  --security-opt seccomp=unconfined \
-  --security-opt apparmor=unconfined \
-  -p 8899:8899 \
-  --shm-size 512m \
-  mimicwx
+docker compose up -d
 ```
 
-### 首次使用
+> 微信登录状态保存在 `wechat-data` volume 中，debug 和 headless 容器共享，切换不丢失。
 
-1. 使用 `MIMICWX_DEBUG=1` 启动容器（启用 VNC）
-2. 打开 noVNC: `http://HOST:6080/vnc.html` (密码: `mimicwx`)
-3. 在虚拟桌面中扫码登录微信
-4. GDB 自动提取数据库密钥 → MimicWX 自动启动
-5. 通过 API 接口开始使用
-6. 后续重启可去掉 `MIMICWX_DEBUG=1`，以 headless 模式运行
+### 本地开发
+
+使用 `Dockerfile.dev` 构建开发镜像（含 VNC + Rust 工具链 + cargo-watch）：
+
+```bash
+make up       # 构建 dev 镜像并启动（首次需要通过 noVNC 扫码）
+make dev      # 容器内 cargo-watch 热编译（监听 src/ 变化自动重启）
+```
+
+其他 make 命令：
+
+| 命令 | 说明 |
+|------|------|
+| `make up` | 构建 dev 镜像并启动 |
+| `make start` | 启动已构建的 dev 容器 |
+| `make stop` | 停止容器 |
+| `make dev` | 容器内热编译开发模式 |
+| `make build` | 容器内手动编译一次 |
+| `make shell` | 进入容器 shell |
+| `make logs` | 查看容器日志 |
+| `make attach` | 进入交互式控制台 (`Ctrl+P Ctrl+Q` 退出) |
 
 ### 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `MIMICWX_DEBUG` | `0` | 设为 `1` 启用 VNC + noVNC debug 模式 |
+| `MIMICWX_API_PORT` | `8899` | API 监听端口 |
+| `MIMICWX_VNC_PORT` | `5901` | VNC 端口 (仅 debug 模式) |
+| `MIMICWX_NOVNC_PORT` | `6080` | noVNC 端口 (仅 debug 模式) |
+| `MIMICWX_DISPLAY_NUM` | `1` | X11 DISPLAY 编号 |
 
 ### 访问入口
 
@@ -330,8 +339,8 @@ docker run -d --name mimicwx \
 |------|------|------|
 | API | `http://HOST:8899` | REST API 接口 |
 | WebSocket | `ws://HOST:8899/ws` | JSON-RPC 2.0 + 实时事件推送 |
-| noVNC | `http://HOST:6080/vnc.html` | 浏览器远程桌面 (仅 `MIMICWX_DEBUG=1`) |
-| VNC | `vnc://HOST:5901` | VNC 客户端连接 (仅 `MIMICWX_DEBUG=1`) |
+| noVNC | `http://HOST:6080/vnc.html` | 浏览器远程桌面 (仅 debug 模式，密码: `mimicwx`) |
+| VNC | `vnc://HOST:5901` | VNC 客户端连接 (仅 debug 模式) |
 
 ---
 
