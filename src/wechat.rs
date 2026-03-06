@@ -152,6 +152,7 @@ impl WeChat {
     }
 
     /// 查找 [splitter] — 会话列表和聊天区域的容器
+    #[allow(dead_code)]
     pub async fn find_split_pane(&self, app: &NodeRef) -> Option<NodeRef> {
         self.atspi
             .find_bfs(app, |role, _| role == "splitter" || role == "split pane")
@@ -207,6 +208,7 @@ impl WeChat {
     }
 
     /// 在 app 范围内查找输入框 (role=entry 或 role=text) — DFS 到 depth 18
+    #[allow(dead_code)]
     pub async fn find_edit_box(&self, app: &NodeRef) -> Option<NodeRef> {
         self.atspi
             .find_dfs(

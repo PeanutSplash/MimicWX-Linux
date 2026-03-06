@@ -571,6 +571,7 @@ impl InputEngine {
     }
 
     /// 鼠标右键点击
+    #[allow(dead_code)]
     pub async fn right_click(&mut self, x: i32, y: i32) -> Result<()> {
         self.move_mouse(x, y).await?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -591,6 +592,7 @@ impl InputEngine {
     /// 鼠标滚轮 (正=上, 负=下)
     ///
     /// X11: button 4 = scroll up, button 5 = scroll down
+    #[allow(dead_code)]
     pub async fn scroll(&mut self, x: i32, y: i32, clicks: i32) -> Result<()> {
         self.move_mouse(x, y).await?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

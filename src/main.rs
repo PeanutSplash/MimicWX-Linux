@@ -1100,7 +1100,6 @@ async fn console_loop(
             match bytes[i] {
                 b'\r' | b'\n' => {
                     exec = true;
-                    i += 1;
                     break;
                 }
                 0x7f | 0x08 => {

@@ -23,6 +23,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 const IFACE_ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
 const IFACE_COMPONENT: &str = "org.a11y.atspi.Component";
+#[allow(dead_code)]
 const IFACE_TEXT: &str = "org.a11y.atspi.Text";
 const PROPS: &str = "org.freedesktop.DBus.Properties";
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
@@ -416,6 +417,7 @@ impl AtSpi {
         Some(BBox { x, y, w, h })
     }
 
+    #[allow(dead_code)]
     pub async fn text(&self, node: &NodeRef) -> Option<String> {
         let reply = self
             .call(
@@ -430,6 +432,7 @@ impl AtSpi {
     }
 
     /// 读取 Description 属性
+    #[allow(dead_code)]
     pub async fn description(&self, node: &NodeRef) -> String {
         let reply = self
             .call(
@@ -449,6 +452,7 @@ impl AtSpi {
     }
 
     /// 获取 Parent 节点
+    #[allow(dead_code)]
     pub async fn parent(&self, node: &NodeRef) -> Option<NodeRef> {
         let reply = self
             .call(
@@ -468,6 +472,7 @@ impl AtSpi {
 
     /// 获取节点状态位集合 (AT-SPI2 StateSet)
     /// 返回 64 位状态标志 (两个 u32 合并)
+    #[allow(dead_code)]
     pub async fn get_states(&self, node: &NodeRef) -> u64 {
         let reply = self
             .call(
@@ -493,12 +498,14 @@ impl AtSpi {
     }
 
     /// 检查节点是否处于 SELECTED 状态 (AT-SPI2 STATE_SELECTED = bit 25)
+    #[allow(dead_code)]
     pub async fn is_selected(&self, node: &NodeRef) -> bool {
         let states = self.get_states(node).await;
         states & (1 << 25) != 0
     }
 
     /// 强制聚焦节点 (将窗口提到前台)
+    #[allow(dead_code)]
     pub async fn grab_focus(&self, node: &NodeRef) -> bool {
         let reply = self
             .call(

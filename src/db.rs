@@ -90,6 +90,7 @@ pub enum MsgContent {
 
 impl MsgContent {
     /// 消息类型的简短描述 (用于日志)
+    #[allow(dead_code)]
     pub fn type_label(&self) -> &'static str {
         match self {
             Self::Text { .. } => "文本",
@@ -1008,6 +1009,7 @@ impl DbManager {
     }
 
     /// 订阅 WAL 变化通知
+    #[allow(dead_code)]
     pub fn subscribe_wal_events(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.wal_notify.subscribe()
     }

@@ -59,6 +59,7 @@ impl ChatWnd {
     }
 
     /// 刷新窗口节点引用 (窗口可能被重新创建)
+    #[allow(dead_code)]
     pub fn update_window_node(&mut self, node: NodeRef) {
         self.window_node.rebind(node.clone());
         self.edit_box_node.set_search_root(node.clone());
@@ -160,6 +161,7 @@ impl ChatWnd {
     }
 
     /// 在此独立窗口中查找输入框
+    #[allow(dead_code)]
     pub async fn find_edit_box(&self) -> Option<NodeRef> {
         let mut handle = self.edit_box_node.clone();
         handle.resolve(&self.atspi).await
