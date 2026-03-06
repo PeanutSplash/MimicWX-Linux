@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 use crate::atspi::{is_structural_role, AtSpi, NodeRef, SearchAction};
 use crate::chatwnd::ChatWnd;
 use crate::input::InputEngine;
+use crate::node_handle::{NameMatch, NodeFingerprint, NodeHandle};
 
 // =====================================================================
 // 状态
@@ -526,7 +527,8 @@ impl WeChat {
         // 2. 检查是否有未注册的独立窗口
         if let Some(wnd_node) = self.find_chat_window(&app, who).await {
             let mut windows = self.listen_windows.lock().await;
-            let mut chatwnd = ChatWnd::new(who.to_string(), self.atspi.clone(), wnd_node);
+            let mut chatwnd =
+                ChatWnd::new(who.to_string(), self.atspi.clone(), app.clone(), wnd_node);
             chatwnd.init_edit_box().await;
             chatwnd.init_msg_list().await;
             windows.insert(who.to_string(), chatwnd);
@@ -602,7 +604,8 @@ impl WeChat {
         .await;
 
         if let Some(wnd_node) = wnd_node {
-            let mut chatwnd = ChatWnd::new(who.to_string(), self.atspi.clone(), wnd_node);
+            let mut chatwnd =
+                ChatWnd::new(who.to_string(), self.atspi.clone(), app.clone(), wnd_node);
             chatwnd.init_edit_box().await;
             chatwnd.init_msg_list().await;
             let mut windows = self.listen_windows.lock().await;
@@ -645,42 +648,27 @@ impl WeChat {
     /// 1. 在 wechat app 的子节点中查找以 who 命名的 frame (独立窗口是 app 的子 frame)
     /// 2. 在 AT-SPI2 registry 中查找单独注册的窗口
     async fn find_chat_window(&self, app: &NodeRef, who: &str) -> Option<NodeRef> {
-        // 策略 1: 在 wechat app 的直接子节点中查找
-        let app_child_count = self.atspi.child_count(app).await;
-        for i in 0..app_child_count.min(20) {
-            if let Some(child) = self.atspi.child_at(app, i).await {
-                let role = self.atspi.role(&child).await;
-                let name = self.atspi.name(&child).await;
-                if role == "frame" && name.contains(who) && !is_wechat_main(&name) {
-                    debug!("📌 找到独立聊天窗口 (app 子节点): {name}");
-                    return Some(child);
-                }
+        let fingerprint = NodeFingerprint::new(["frame"], NameMatch::Contains(who.to_string()));
+
+        if let Some(child) = NodeHandle::search(&self.atspi, app, &fingerprint).await {
+            let name = self.atspi.name(&child).await;
+            if !is_wechat_main(&name) {
+                debug!("📌 找到独立聊天窗口 (app 子树): {name}");
+                return Some(child);
             }
         }
 
-        // 策略 2: 在 AT-SPI2 registry 中查找单独注册的窗口
         if let Some(registry) = AtSpi::registry() {
             let count = self.atspi.child_count(&registry).await;
             for i in 0..count {
                 if let Some(child) = self.atspi.child_at(&registry, i).await {
-                    let name = self.atspi.name(&child).await;
-                    if name.contains(who) && !is_wechat_main(&name) {
-                        // 遍历子 frame
-                        let child_count = self.atspi.child_count(&child).await;
-                        for j in 0..child_count.min(5) {
-                            if let Some(frame) = self.atspi.child_at(&child, j).await {
-                                let role = self.atspi.role(&frame).await;
-                                if role == "frame" {
-                                    let fname = self.atspi.name(&frame).await;
-                                    if fname.contains(who) {
-                                        debug!("📌 找到独立聊天窗口 (registry): {fname}");
-                                        return Some(frame);
-                                    }
-                                }
-                            }
+                    if let Some(frame) = NodeHandle::search(&self.atspi, &child, &fingerprint).await
+                    {
+                        let name = self.atspi.name(&frame).await;
+                        if !is_wechat_main(&name) {
+                            debug!("📌 找到独立聊天窗口 (registry): {name}");
+                            return Some(frame);
                         }
-                        let role = self.atspi.role(&child).await;
-                        debug!("📌 跳过非精确匹配的节点: [{role}] {name} (内层 frame 未匹配)");
                     }
                 }
             }
@@ -862,6 +850,20 @@ impl WeChat {
             }
         }
         false
+    }
+
+    pub async fn verify_sent_after_send(&self, to: &str, text: &str) -> bool {
+        if self.check_listen_window(to).await {
+            let mut windows = self.listen_windows.lock().await;
+            if let Some(chatwnd) = windows.get_mut(to) {
+                return chatwnd.verify_sent_public(text).await;
+            }
+        }
+
+        let Some(app) = self.find_app().await else {
+            return false;
+        };
+        self.verify_sent(&app, text).await
     }
 }
 

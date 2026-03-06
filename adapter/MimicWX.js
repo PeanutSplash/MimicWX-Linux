@@ -11,6 +11,7 @@ import fs from "node:fs/promises"
 import path from "node:path"
 
 const MIMICWX_URL = process.env.MIMICWX_URL || "http://localhost:8899"
+const MIMICWX_WS_ONLY = process.env.MIMICWX_WS_ONLY === "1"
 // ↓↓↓ 在这里填写你的 Token (与 config.toml 中 [api] token 一致) ↓↓↓
 const MIMICWX_TOKEN = "62811901aaAA"
 // ↑↑↑ 如不需要认证留空即可, 也可通过环境变量 MIMICWX_TOKEN 覆盖 ↑↑↑
@@ -31,6 +32,8 @@ Bot.adapter.push(
     ws = null
     self_id = "MimicWX"
     connected = false
+    rpcSeq = 1
+    rpcPending = new Map()
     /** 仅@模式: 群消息仅在被 @ 时触发处理，私聊始终监听 */
     atOnlyMode = false
 
@@ -104,7 +107,8 @@ Bot.adapter.push(
       this.ws.on("message", (raw) => {
         try {
           const data = JSON.parse(raw.toString())
-          this.onMessage(data)
+          if (this.handleRpcFrame(data)) return
+          this.onMessage(this.normalizeWsEvent(data))
         } catch (err) {
           Bot.makeLog("error", ["消息解析失败", raw.toString(), err], "MimicWX")
         }
@@ -121,14 +125,70 @@ Bot.adapter.push(
       })
     }
 
+    handleRpcFrame(data) {
+      if (!data || data.jsonrpc !== "2.0") return false
+      if (Object.prototype.hasOwnProperty.call(data, "id")) {
+        const pending = this.rpcPending.get(String(data.id))
+        if (pending) {
+          this.rpcPending.delete(String(data.id))
+          if (data.error) pending.reject(new Error(data.error.message || "RPC error"))
+          else pending.resolve(data.result)
+        }
+        return true
+      }
+      return false
+    }
+
+    normalizeWsEvent(data) {
+      if (data?.jsonrpc === "2.0" && data.method && data.params) {
+        return data.params
+      }
+      return data
+    }
+
+    async rpcCall(method, params = {}) {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        throw new Error("WebSocket 未连接")
+      }
+      const id = String(this.rpcSeq++)
+      const payload = { jsonrpc: "2.0", method, params, id }
+      return await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          this.rpcPending.delete(id)
+          reject(new Error(`RPC timeout: ${method}`))
+        }, 30000)
+        this.rpcPending.set(id, {
+          resolve: (value) => {
+            clearTimeout(timeout)
+            resolve(value)
+          },
+          reject: (err) => {
+            clearTimeout(timeout)
+            reject(err)
+          },
+        })
+        this.ws.send(JSON.stringify(payload), (err) => {
+          if (err) {
+            clearTimeout(timeout)
+            this.rpcPending.delete(id)
+            reject(err)
+          }
+        })
+      })
+    }
+
     // =========================================================
     // Bot 初始化
     // =========================================================
     async initBot() {
       let status
       try {
-        const res = await fetch(`${MIMICWX_URL}/status`, { headers: authHeaders() })
-        status = await res.json()
+        if (MIMICWX_WS_ONLY) {
+          status = await this.rpcCall("status")
+        } else {
+          const res = await fetch(`${MIMICWX_URL}/status`, { headers: authHeaders() })
+          status = await res.json()
+        }
       } catch {
         Bot.makeLog("warn", "获取状态失败，10秒后重试...", "MimicWX")
         setTimeout(() => this.initBot(), 10000)
@@ -147,8 +207,9 @@ Bot.adapter.push(
       // 获取联系人
       let contacts = []
       try {
-        const res = await fetch(`${MIMICWX_URL}/contacts`, { headers: authHeaders() })
-        const data = await res.json()
+        const data = MIMICWX_WS_ONLY
+          ? await this.rpcCall("contacts")
+          : await fetch(`${MIMICWX_URL}/contacts`, { headers: authHeaders() }).then(res => res.json())
         contacts = data.contacts || []
       } catch (err) {
         Bot.makeLog("warn", `获取联系人失败: ${err.message}`, "MimicWX")
@@ -323,6 +384,10 @@ Bot.adapter.push(
         Bot.makeLog("debug", `消息发送确认: ${data.to} verified=${data.verified}`, this.self_id)
       }
 
+      if (data.type === "status_change") {
+        Bot.makeLog("mark", `运行时状态: ${data.to?.state || "unknown"}`, this.self_id)
+      }
+
       // control: 控制命令 (来自控制台 /atmode)
       if (data.type === "control" && data.cmd === "toggle_at_mode") {
         this.toggleAtMode("控制台")
@@ -337,16 +402,13 @@ Bot.adapter.push(
     async execRemoteCommand(cmd, replyTo) {
       try {
         Bot.makeLog("info", `🎮 主人远程命令: ${cmd}`, this.self_id)
-        const res = await fetch(`${MIMICWX_URL}/command`, {
-          method: "POST",
-          headers: { ...authHeaders(), "Content-Type": "application/json" },
-          body: JSON.stringify({ cmd }),
-        })
-        if (!res.ok) {
-          this.sendText(replyTo, `⚠️ 命令执行失败: HTTP ${res.status}`)
-          return
-        }
-        const data = await res.json()
+        const data = MIMICWX_WS_ONLY
+          ? await this.rpcCall("command", { cmd })
+          : await fetch(`${MIMICWX_URL}/command`, {
+            method: "POST",
+            headers: { ...authHeaders(), "Content-Type": "application/json" },
+            body: JSON.stringify({ cmd }),
+          }).then(res => res.json())
         if (data.result) {
           this.sendText(replyTo, data.result)
         }
@@ -421,12 +483,13 @@ Bot.adapter.push(
       try {
         const body = { to, text }
         if (at.length > 0) body.at = at
-        const res = await fetch(`${MIMICWX_URL}/send`, {
-          method: "POST",
-          headers: authHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify(body),
-        })
-        const result = await res.json()
+        const result = MIMICWX_WS_ONLY
+          ? await this.rpcCall("send", body)
+          : await fetch(`${MIMICWX_URL}/send`, {
+            method: "POST",
+            headers: authHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify(body),
+          }).then(res => res.json())
         if (!result.sent) {
           Bot.makeLog("warn", `文本发送失败: ${result.message || result.error}`, `${this.self_id} => ${to}`)
         }
@@ -486,12 +549,13 @@ Bot.adapter.push(
         Bot.makeLog("info", `发送图片: ${fileName} (${Math.round(base64Data.length * 3 / 4 / 1024)}KB)`,
           `${this.self_id} => ${to}`, true)
 
-        const res = await fetch(`${MIMICWX_URL}/send_image`, {
-          method: "POST",
-          headers: authHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ to, file: base64Data, name: fileName }),
-        })
-        const result = await res.json()
+        const result = MIMICWX_WS_ONLY
+          ? await this.rpcCall("send_image", { to, file: base64Data, name: fileName })
+          : await fetch(`${MIMICWX_URL}/send_image`, {
+            method: "POST",
+            headers: authHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({ to, file: base64Data, name: fileName }),
+          }).then(res => res.json())
         if (!result.sent) {
           Bot.makeLog("warn", `图片发送失败: ${result.message || result.error}`, `${this.self_id} => ${to}`)
         }
