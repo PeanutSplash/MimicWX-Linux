@@ -277,6 +277,7 @@ async fn main() -> Result<()> {
     info!("🌐 API 服务启动: http://{addr}");
     info!("📡 WebSocket: ws://{addr}/ws");
     info!("📌 端点: /status, /screenshot, /contacts, /sessions, /messages/new, /send, /chat, /listen, /ws");
+    info!("📖 API 文档: http://{addr}/docs");
     info!("🔒 API 认证已启用 (Bearer Token)");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

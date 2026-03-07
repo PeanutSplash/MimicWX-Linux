@@ -35,6 +35,8 @@ quick-xml = "0.37"
 zstd = "0.13"
 toml = "0.8"
 base64 = "0.22"
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 # ================================================================
 # Linux-only dependencies (AT-SPI2, DBus, X11 XTEST)

@@ -45,9 +45,11 @@ impl std::fmt::Display for RuntimeState {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct RuntimeSnapshot {
+    /// 运行时状态名称 (如 "Running", "LoginWaiting")
     pub state: String,
+    /// 当前状态的可选原因说明
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

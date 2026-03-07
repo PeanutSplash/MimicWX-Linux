@@ -27,6 +27,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use utoipa::{OpenApi, ToSchema};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -74,14 +75,21 @@ pub struct InputMetrics {
     focus_lost_count: AtomicU64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct InputMetricsSnapshot {
+    /// 当前命令队列深度
     pub queue_depth: u32,
+    /// 已执行命令总数
     pub total_commands: u64,
+    /// 失败命令总数
     pub total_failures: u64,
+    /// 最近一次命令耗时 (毫秒)
     pub last_command_ms: u64,
+    /// 历史最大命令耗时 (毫秒)
     pub max_command_ms: u64,
+    /// 剪贴板获取失败次数
     pub clipboard_acquire_failures: u64,
+    /// 焦点丢失次数
     pub focus_lost_count: u64,
 }
 
@@ -419,6 +427,57 @@ async fn auth_layer(
 // 路由
 // =====================================================================
 
+// =====================================================================
+// OpenAPI documentation
+// =====================================================================
+
+use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearer",
+                SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+            );
+        }
+    }
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "MimicWX-Linux API",
+        description = "微信自动化框架 REST API。通过 AT-SPI2 无障碍接口 + X11 XTEST 输入注入实现零风险微信自动化。\n\n## 认证方式\n- Header: `Authorization: Bearer <token>`\n- Query: `?token=<token>` (支持 URL 编码)\n- 未配置 Token 时自动跳过认证\n\n## 免认证接口\n- `GET /status` — 服务状态\n- `GET /screenshot` — 屏幕截图 (用于扫码登录)\n\n## 实时推送\n- `GET /ws` — WebSocket 连接, 支持 JSON-RPC 2.0 双向通信\n\n## 超时机制\n所有操作类接口 (发送、切换、监听) 均有 30 秒超时限制。",
+        version = env!("CARGO_PKG_VERSION"),
+    ),
+    paths(
+        get_status, get_screenshot,
+        get_contacts, get_new_messages, get_sessions,
+        send_message, send_image, chat_with,
+        get_listen_list, add_listen, remove_listen,
+        get_tree, get_session_tree, exec_command,
+    ),
+    components(schemas(
+        StatusResponse, RuntimeSnapshot, InputMetricsSnapshot,
+        SendRequest, SendImageRequest, SendResponse,
+        ChatRequest, ChatResponse,
+        ListenRequest, ListenResponse,
+        CommandReqSchema,
+    )),
+    modifiers(&SecurityAddon),
+    tags(
+        (name = "Status", description = "服务状态与截图"),
+        (name = "Data", description = "联系人、会话与消息"),
+        (name = "Actions", description = "发送消息、切换聊天、执行命令"),
+        (name = "Listen", description = "监听管理"),
+        (name = "Debug", description = "AT-SPI2 调试工具"),
+    )
+)]
+struct ApiDoc;
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     // 需要认证的路由
     let protected = Router::new()
@@ -442,6 +501,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/status", get(get_status))
         .route("/screenshot", get(get_screenshot))
         .merge(protected)
+        .merge(
+            utoipa_swagger_ui::SwaggerUi::new("/docs")
+                .url("/api-docs/openapi.json", ApiDoc::openapi()),
+        )
         .layer(tower_http::cors::CorsLayer::permissive()) // ⑩ CORS 支持
         .with_state(state)
 }
@@ -450,31 +513,42 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 // 请求/响应类型
 // =====================================================================
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct StatusResponse {
+    /// 微信连接状态 (如 "Connected", "Disconnected")
     status: String,
+    /// 运行时状态 (state + 可选 reason)
     runtime: RuntimeSnapshot,
+    /// 输入引擎性能指标
     input_metrics: InputMetricsSnapshot,
+    /// MimicWX 版本号 (如 "0.5.1")
     version: String,
+    /// 当前活跃监听数量
     listen_count: usize,
+    /// 数据库是否可用 (密钥已解密)
     db_available: bool,
+    /// 数据库中的联系人总数
     contacts: usize,
+    /// 服务运行时长 (秒)
     uptime_secs: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SendRequest {
+    /// 接收者名称 (联系人或群组)
     to: String,
+    /// 消息文本
     text: String,
-    /// 要 @ 的人的显示名列表 (可选)
+    /// 需要 @ 的显示名称列表 (可选)
     #[serde(default)]
     at: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SendImageRequest {
+    /// 接收者名称 (联系人或群组)
     to: String,
-    /// base64 编码的图片数据
+    /// Base64 编码的图片数据
     file: String,
     /// 文件名 (可选, 用于推断 MIME 类型)
     #[serde(default = "default_image_name")]
@@ -485,39 +559,62 @@ fn default_image_name() -> String {
     "image.png".to_string()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct SendResponse {
+    /// 消息是否已发送
     sent: bool,
+    /// 消息是否已验证送达
     verified: bool,
+    /// 状态信息
     message: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct ChatRequest {
+    /// 要切换到的联系人或群组名称
     who: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ChatResponse {
+    /// 切换是否成功
     success: bool,
+    /// 切换后的当前聊天名称
     chat_name: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct ListenRequest {
+    /// 联系人或群组名称
     who: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ListenResponse {
+    /// 操作是否成功
     success: bool,
+    /// 状态信息
     message: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[allow(dead_code)]
+struct CommandReqSchema {
+    /// 命令字符串 (如 "status", "send <to> <text>", "listen <who>")
+    cmd: String,
 }
 
 // =====================================================================
 // Handlers
 // =====================================================================
 
+#[utoipa::path(
+    get, path = "/status",
+    tag = "Status",
+    summary = "服务状态 (免认证)",
+    description = "获取 MimicWX 服务的完整状态快照, 包括:\n- 微信连接状态\n- 运行时状态 (Running / LoginWaiting 等)\n- 输入引擎指标 (队列深度、命令耗时、失败次数)\n- 监听数量、数据库可用性、联系人数量、运行时长\n\n此接口免认证, 可用于健康检查和监控。",
+    responses((status = 200, description = "当前服务状态", body = StatusResponse))
+)]
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let status = state.wechat.check_status().await;
     let runtime = state.runtime.snapshot().await;
@@ -542,6 +639,16 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
     })
 }
 
+#[utoipa::path(
+    get, path = "/screenshot",
+    tag = "Status",
+    summary = "X11 屏幕截图 (免认证, 用于扫码)",
+    description = "通过 X11 截取当前屏幕画面并返回 PNG 图片。\n\n主要用于远程扫码登录微信: 获取截图后识别二维码完成登录。\n此接口免认证, 在阻塞线程中执行截屏操作。",
+    responses(
+        (status = 200, description = "PNG 图片", content_type = "image/png"),
+        (status = 500, description = "截图失败")
+    )
+)]
 async fn get_screenshot() -> Result<impl IntoResponse, ApiError> {
     let png_data = tokio::task::spawn_blocking(crate::input::capture_screenshot)
         .await
@@ -775,11 +882,34 @@ async fn sessions_value(state: &Arc<AppState>) -> Value {
     serde_json::to_value(state.wechat.list_sessions().await).unwrap_or_default()
 }
 
-/// 联系人列表 (从数据库)
+#[utoipa::path(
+    get, path = "/contacts",
+    tag = "Data",
+    summary = "联系人列表 (来自数据库)",
+    description = "从微信 SQLCipher 数据库读取完整联系人列表。\n\n需要数据库已解密并可用 (密钥自动从内存提取)。\n返回格式: `{ \"contacts\": [...] }`",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "联系人列表 `{ \"contacts\": [...] }`"),
+        (status = 401, description = "未授权 — Token 缺失或不匹配"),
+        (status = 503, description = "数据库不可用 — 密钥尚未获取或数据库未初始化")
+    )
+)]
 async fn get_contacts(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(contacts_value(&state).await?))
 }
 
+#[utoipa::path(
+    get, path = "/messages/new",
+    tag = "Data",
+    summary = "增量新消息 (来自数据库)",
+    description = "从微信数据库增量拉取新消息。每次调用返回上次拉取后的新消息, 适合轮询场景。\n\n需要数据库已解密并可用。",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "新消息数组"),
+        (status = 401, description = "未授权 — Token 缺失或不匹配"),
+        (status = 503, description = "数据库不可用 — 密钥尚未获取或数据库未初始化")
+    )
+)]
 async fn get_new_messages(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -793,6 +923,20 @@ async fn get_new_messages(
     }
 }
 
+#[utoipa::path(
+    post, path = "/send",
+    tag = "Actions",
+    summary = "发送文本消息",
+    description = "向指定联系人或群组发送文本消息。\n\n**执行流程:**\n1. 检查目标的监听窗口是否存在, 若丢失则自动恢复\n2. 通过 AT-SPI 定位聊天窗口并注入文本\n3. 支持 `at` 字段批量 @ 群成员\n4. 双重验证送达: 先通过 AT-SPI 控件树验证, 再通过数据库确认\n\n**超时:** 30 秒\n\n**返回字段:**\n- `sent`: 消息是否成功发出\n- `verified`: 是否确认送达 (数据库验证 > AT-SPI 验证 > 控件树回查)\n- `message`: 状态描述",
+    security(("bearer" = [])),
+    request_body = SendRequest,
+    responses(
+        (status = 200, description = "发送结果", body = SendResponse),
+        (status = 401, description = "未授权 — Token 缺失或不匹配"),
+        (status = 500, description = "发送失败 — AT-SPI 操作异常或超时"),
+        (status = 503, description = "输入引擎不可用 — Actor 队列已关闭")
+    )
+)]
 async fn send_message(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SendRequest>,
@@ -800,6 +944,20 @@ async fn send_message(
     Ok(Json(send_message_inner(&state, req).await?))
 }
 
+#[utoipa::path(
+    post, path = "/send_image",
+    tag = "Actions",
+    summary = "发送图片 (Base64 编码)",
+    description = "向指定联系人或群组发送图片。\n\n**请求参数:**\n- `to`: 接收者名称\n- `file`: 图片的 Base64 编码数据\n- `name`: 文件名 (可选, 默认 `image.png`, 用于推断格式)\n\n**执行流程:**\n1. 解码 Base64 数据并写入临时文件 (`/tmp/mimicwx_img_*`)\n2. 检查并恢复目标监听窗口\n3. 通过微信文件发送功能注入图片\n4. 发送完成后自动清理临时文件\n\n**超时:** 30 秒",
+    security(("bearer" = [])),
+    request_body = SendImageRequest,
+    responses(
+        (status = 200, description = "发送结果", body = SendResponse),
+        (status = 401, description = "未授权 — Token 缺失或不匹配"),
+        (status = 500, description = "发送失败 — Base64 解码错误、文件写入失败或 AT-SPI 异常"),
+        (status = 503, description = "输入引擎不可用 — Actor 队列已关闭")
+    )
+)]
 async fn send_image(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SendImageRequest>,
@@ -807,10 +965,35 @@ async fn send_image(
     Ok(Json(send_image_inner(&state, req).await?))
 }
 
+#[utoipa::path(
+    get, path = "/sessions",
+    tag = "Data",
+    summary = "会话列表 (优先数据库, 回退 AT-SPI)",
+    description = "获取微信会话列表 (最近聊天)。\n\n**数据源优先级:**\n1. 优先从 SQLCipher 数据库查询 (数据更完整)\n2. 数据库不可用或查询失败时, 回退到 AT-SPI2 控件树解析\n\nAT-SPI 方式仅能获取当前可见的会话列表。",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "会话列表数组"),
+        (status = 401, description = "未授权 — Token 缺失或不匹配")
+    )
+)]
 async fn get_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(sessions_value(&state).await)
 }
 
+#[utoipa::path(
+    post, path = "/chat",
+    tag = "Actions",
+    summary = "切换当前聊天",
+    description = "切换微信主窗口的当前聊天对象。\n\n通过 AT-SPI2 在会话列表中搜索并点击目标联系人/群组, 使其成为活跃聊天。\n\n**返回字段:**\n- `success`: 是否成功切换\n- `chat_name`: 切换后的聊天名称 (失败时为 null)\n\n**超时:** 30 秒",
+    security(("bearer" = [])),
+    request_body = ChatRequest,
+    responses(
+        (status = 200, description = "切换结果", body = ChatResponse),
+        (status = 401, description = "未授权 — Token 缺失或不匹配"),
+        (status = 500, description = "切换失败 — 未找到目标会话或 AT-SPI 异常"),
+        (status = 503, description = "输入引擎不可用 — Actor 队列已关闭")
+    )
+)]
 async fn chat_with(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
@@ -818,6 +1001,20 @@ async fn chat_with(
     Ok(Json(chat_with_inner(&state, req).await?))
 }
 
+#[utoipa::path(
+    post, path = "/listen",
+    tag = "Listen",
+    summary = "添加监听 (打开独立聊天窗口)",
+    description = "为指定联系人或群组添加消息监听。\n\n**执行流程:**\n1. 在微信中搜索目标联系人/群组\n2. 弹出独立的聊天窗口 (与主窗口分离)\n3. 通过 AT-SPI2 持续监听该窗口的新消息\n\n独立窗口确保监听不会干扰主窗口的正常操作。若监听窗口意外关闭, 发送消息时会自动恢复。\n\n**超时:** 30 秒",
+    security(("bearer" = [])),
+    request_body = ListenRequest,
+    responses(
+        (status = 200, description = "监听结果", body = ListenResponse),
+        (status = 401, description = "未授权 — Token 缺失或不匹配"),
+        (status = 500, description = "监听失败 — 未找到目标或无法弹出独立窗口"),
+        (status = 503, description = "输入引擎不可用 — Actor 队列已关闭")
+    )
+)]
 async fn add_listen(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ListenRequest>,
@@ -825,6 +1022,18 @@ async fn add_listen(
     Ok(Json(add_listen_inner(&state, req).await?))
 }
 
+#[utoipa::path(
+    delete, path = "/listen",
+    tag = "Listen",
+    summary = "移除监听",
+    description = "移除指定联系人或群组的消息监听, 并关闭对应的独立聊天窗口。\n\n若目标不在监听列表中, `success` 返回 false。",
+    security(("bearer" = [])),
+    request_body = ListenRequest,
+    responses(
+        (status = 200, description = "移除结果", body = ListenResponse),
+        (status = 401, description = "未授权 — Token 缺失或不匹配")
+    )
+)]
 async fn remove_listen(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ListenRequest>,
@@ -832,11 +1041,34 @@ async fn remove_listen(
     Json(remove_listen_inner(&state, req).await)
 }
 
+#[utoipa::path(
+    get, path = "/listen",
+    tag = "Listen",
+    summary = "获取监听列表",
+    description = "获取当前所有活跃监听的联系人/群组名称列表。\n\n返回字符串数组, 如 `[\"张三\", \"工作群\"]`。",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "监听名称数组, 如 `[\"张三\", \"工作群\"]`"),
+        (status = 401, description = "未授权 — Token 缺失或不匹配")
+    )
+)]
 async fn get_listen_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let list = state.wechat.get_listen_list().await;
     Json(list)
 }
 
+#[utoipa::path(
+    get, path = "/debug/tree",
+    tag = "Debug",
+    summary = "AT-SPI2 控件树",
+    description = "导出微信应用的 AT-SPI2 无障碍控件树, 用于调试和开发。\n\n返回嵌套的控件节点数组, 包含角色、名称、状态等属性。可通过 `depth` 参数控制遍历深度。",
+    security(("bearer" = [])),
+    params(("depth" = Option<u32>, Query, description = "最大树深度 (默认 5, 最大 15)")),
+    responses(
+        (status = 200, description = "控件树节点数组 (微信未运行时返回空数组)"),
+        (status = 401, description = "未授权 — Token 缺失或不匹配")
+    )
+)]
 async fn get_tree(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -854,7 +1086,17 @@ async fn get_tree(
     }
 }
 
-/// 只 dump 会话容器的子树 (用于调试)
+#[utoipa::path(
+    get, path = "/debug/sessions",
+    tag = "Debug",
+    summary = "会话容器子树 (调试)",
+    description = "导出微信会话列表容器的 AT-SPI2 子树 (固定深度 4)。\n\n用于调试会话列表的控件结构, 查看各会话项的名称、角色和层级关系。",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "会话容器控件树 (微信未运行或未找到容器时返回空数组)"),
+        (status = 401, description = "未授权 — Token 缺失或不匹配")
+    )
+)]
 async fn get_session_tree(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if let Some(app) = state.wechat.find_app().await {
         if let Some(container) = state.wechat.find_session_list(&app).await {
@@ -1034,6 +1276,18 @@ struct CommandReq {
     cmd: String,
 }
 
+#[utoipa::path(
+    post, path = "/command",
+    tag = "Actions",
+    summary = "执行命令 (通用命令接口)",
+    description = "通用命令执行接口, 支持以下命令:\n\n| 命令 | 说明 |\n|------|------|\n| `status` | 获取详细运行状态 |\n| `send <收件人> <内容>` | 发送文本消息 |\n| `listen <联系人/群名>` | 添加监听并持久化到配置文件 |\n| `unlisten <联系人/群名>` | 移除监听并更新配置文件 |\n| `reload` | 重载配置文件, 自动 diff 监听列表和参数变更 |\n| `atmode` | 切换仅@模式 (通过 WebSocket 广播控制指令) |\n\n返回格式: `{ \"ok\": true, \"result\": \"...\" }`",
+    security(("bearer" = [])),
+    request_body = CommandReqSchema,
+    responses(
+        (status = 200, description = "命令执行结果 `{ \"ok\": true, \"result\": \"...\" }`"),
+        (status = 401, description = "未授权 — Token 缺失或不匹配")
+    )
+)]
 async fn exec_command(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CommandReq>,
