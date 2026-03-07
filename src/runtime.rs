@@ -110,7 +110,7 @@ impl RuntimeManager {
         let previous = current.clone();
         *current = next.clone();
 
-        info!("🧭 RuntimeState: {} -> {}", previous, next);
+        info!("状态: {} -> {}", previous, next);
         let _ = self.tx.send(RuntimeTransition {
             from: RuntimeSnapshot::from(&previous),
             to: RuntimeSnapshot::from(&next),

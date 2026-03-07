@@ -377,7 +377,7 @@ impl WeChat {
             }
         }
 
-        info!("💬 ChatWith: {who}");
+        debug!("ChatWith: {who}");
 
         // 先聚焦主窗口 (独立窗口可能遮挡)
         self.focus_main_window(engine).await;
@@ -623,13 +623,12 @@ impl WeChat {
     pub async fn remove_listen(&self, engine: &InputEngine, who: &str) -> bool {
         let mut windows = self.listen_windows.lock().await;
         if windows.remove(who).is_some() {
-            info!("👂 移除监听: {who}");
             drop(windows); // 释放锁
                            // X11 原生关闭窗口
             match engine.close_window_by_title(who) {
-                Ok(true) => info!("👂 已关闭独立窗口: {who}"),
-                Ok(false) => info!("👂 未找到独立窗口 (可能已关闭): {who}"),
-                Err(e) => warn!("👂 X11 关闭窗口失败: {e}"),
+                Ok(true) => info!("👂 已移除监听并关闭窗口: {who}"),
+                Ok(false) => info!("👂 已移除监听: {who} (窗口已关闭)"),
+                Err(e) => warn!("👂 已移除监听: {who}, 但关闭窗口失败: {e}"),
             }
             *self.current_chat.lock().await = None;
             true
@@ -712,18 +711,18 @@ impl WeChat {
         }
         // 注意: 这里不检查 "之前是否监听过" — 如果窗口刚被 check_listen_window 移除,
         // 说明之前确实在监听, 值得尝试恢复
-        info!("🔄 尝试自动恢复独立窗口: {to}");
+        debug!("尝试自动恢复独立窗口: {to}");
         match self.add_listen(engine, to).await {
             Ok(true) => {
-                info!("✅ 独立窗口自动恢复成功: {to}");
+                debug!("独立窗口自动恢复成功: {to}");
                 true
             }
             Ok(false) => {
-                warn!("⚠️ 独立窗口自动恢复失败: {to}");
+                debug!("独立窗口自动恢复失败: {to}");
                 false
             }
             Err(e) => {
-                warn!("⚠️ 独立窗口自动恢复出错: {to} — {e}");
+                warn!("独立窗口自动恢复出错: {to} — {e}");
                 false
             }
         }
@@ -758,7 +757,7 @@ impl WeChat {
         at: &[String],
         skip_verify: bool,
     ) -> Result<(bool, bool, String)> {
-        info!("📤 开始发送: [{to}] → {text} (@ {} 人)", at.len());
+        debug!("发送消息: [{to}] text_len={} at={}", text.len(), at.len());
 
         // 优先使用独立窗口
         if self.check_listen_window(to).await {
@@ -803,7 +802,7 @@ impl WeChat {
         } else {
             "消息已发送 (未验证)"
         };
-        info!("✅ 完成: [{to}] verified={verified}");
+        info!("📤 [{to}] 消息已发送 (verified={verified})");
         Ok((true, verified, msg.into()))
     }
 
@@ -814,7 +813,7 @@ impl WeChat {
         to: &str,
         image_path: &str,
     ) -> Result<(bool, bool, String)> {
-        info!("🖼️ 开始发送图片: [{to}] → {image_path}");
+        debug!("发送图片: [{to}] → {image_path}");
 
         // 优先使用独立窗口
         if self.check_listen_window(to).await {
@@ -835,7 +834,7 @@ impl WeChat {
 
         engine.press_enter().await?;
 
-        info!("✅ 图片发送完成: [{to}]");
+        info!("🖼️ [{to}] 图片已发送");
         Ok((true, false, "图片已发送".into()))
     }
 

@@ -272,7 +272,7 @@ impl DbManager {
             key_bytes.len()
         );
 
-        info!("📦 DbManager 初始化: db_dir={}", db_dir.display());
+        debug!("DbManager 初始化: db_dir={}", db_dir.display());
 
         // 从 db_dir 路径提取自己的 wxid
         // 路径格式: .../wxid_xxx_c024/db_storage
@@ -298,7 +298,7 @@ impl DbManager {
             })
             .unwrap_or_default();
         if !self_wxid.is_empty() {
-            info!("👤 当前账号: {}", self_wxid);
+            debug!("当前账号: {}", self_wxid);
         }
 
         // 自动发现并连接所有 message_N.db
@@ -312,11 +312,11 @@ impl DbManager {
                         let rel_path = format!("message/{}", name);
                         match Self::open_db(&key_bytes, &db_dir, &rel_path) {
                             Ok(conn) => {
-                                info!("🔗 {} 持久连接已建立", name);
+                                debug!("{} 持久连接已建立", name);
                                 conns.insert(rel_path, Arc::new(std::sync::Mutex::new(conn)));
                             }
                             Err(e) => {
-                                info!("⚠️ {} 暂不可用 (将在查询时重试): {}", name, e);
+                                debug!("{} 暂不可用 (将在查询时重试): {}", name, e);
                             }
                         }
                     }
@@ -326,7 +326,7 @@ impl DbManager {
         if conns.is_empty() {
             warn!("⚠️ 未发现可用的 message 数据库 (将在首次查询时重试)");
         } else {
-            info!("📂 已连接 {} 个消息数据库", conns.len());
+            debug!("已连接 {} 个消息数据库", conns.len());
         }
 
         let (wal_tx, _) = tokio::sync::broadcast::channel::<()>(64);
@@ -400,7 +400,7 @@ impl DbManager {
             .lock()
             .map_err(|e| anyhow::anyhow!("msg_conns lock poisoned: {}", e))?;
         if guard.is_empty() {
-            info!("🔗 重新扫描 message 数据库...");
+            debug!("重新扫描 message 数据库...");
             let msg_dir = self.db_dir.join("message");
             if msg_dir.exists() {
                 if let Ok(entries) = std::fs::read_dir(&msg_dir) {
@@ -412,7 +412,7 @@ impl DbManager {
                                 if let Ok(conn) =
                                     Self::open_db(&self.key_bytes, &self.db_dir, &rel_path)
                                 {
-                                    info!("🔗 {} 持久连接已建立", name);
+                                    debug!("{} 持久连接已建立", name);
                                     guard.insert(rel_path, Arc::new(std::sync::Mutex::new(conn)));
                                 }
                             }
@@ -442,7 +442,7 @@ impl DbManager {
                 .map_err(|e| anyhow::anyhow!("contact_conn lock: {}", e))?;
             if guard.is_none() {
                 *guard = Some(Self::open_db(&key, &dir, "contact/contact.db")?);
-                info!("🔗 contact.db 持久连接已建立");
+                debug!("contact.db 持久连接已建立");
             }
             let conn = guard.as_ref().unwrap();
             let mut stmt =
@@ -494,7 +494,7 @@ impl DbManager {
                 cache.insert(c.username.clone(), c);
             }
         } // 锁在此释放, 不阻塞 get_new_messages 等热路径
-        info!("👥 联系人缓存: {} 条", count);
+        debug!("联系人缓存: {} 条", count);
 
         // 从 chat_room 表补充群名 (锁已释放, spawn_blocking 不会阻塞读操作)
         let chatrooms = {
@@ -557,7 +557,7 @@ impl DbManager {
                 }
             }
             if added > 0 {
-                info!("👥 群聊名称补充: {} 条", added);
+                debug!("群聊名称补充: {} 条", added);
             }
         }
 
@@ -570,7 +570,7 @@ impl DbManager {
                 .get(&self.self_wxid)
                 .map(|c| c.display_name.clone());
             if let Some(name) = name {
-                info!("👤 当前账号昵称: {} ({})", name, self.self_wxid);
+                debug!("当前账号昵称: {} ({})", name, self.self_wxid);
                 *self.self_display_name.write().await = name;
             }
         }
@@ -611,7 +611,7 @@ impl DbManager {
                     .map_err(|e| anyhow::anyhow!("session_conn lock: {}", e))?;
                 if guard.is_none() {
                     *guard = Some(Self::open_db(&key, &dir, "session/session.db")?);
-                    info!("🔗 session.db 持久连接已建立");
+                    debug!("session.db 持久连接已建立");
                 }
                 let conn = guard.as_ref().unwrap();
                 let mut stmt = conn.prepare(
@@ -700,7 +700,7 @@ impl DbManager {
                     } else {
                         // 新表: PRAGMA 获取列结构
                         if let Some(meta) = build_single_table_meta(&conn, table) {
-                            info!("📋 {} 新增表结构缓存: {}", db_name, table);
+                            debug!("{} 新增表结构缓存: {}", db_name, table);
                             meta_cache.insert(cache_key, meta.clone());
                             table_metas.push(meta);
                         }
@@ -983,19 +983,19 @@ impl DbManager {
                                 content_trimmed.contains(&text_owned)
                                 || text_owned.contains(content_trimmed)
                             ) {
-                                info!("✅ [DB] 发送验证成功");
+                                debug!("[DB] 发送验证成功");
                                 return Ok(true);
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            warn!("⚠️ [DB] 自发消息广播通道已关闭");
+                            debug!("[DB] 自发消息广播通道已关闭");
                             break;
                         }
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    warn!("⚠️ [DB] 发送验证超时 (5s)");
+                    debug!("[DB] 发送验证超时 (5s)");
                     break;
                 }
             }
@@ -1098,17 +1098,17 @@ fn wal_watch_loop(db_dir: &Path, tx: tokio::sync::broadcast::Sender<()>) -> Resu
     use fanotify::high_level::*;
 
     let self_pid = std::process::id() as i32;
-    info!("🔍 fanotify PID 过滤: self_pid={}", self_pid);
+    debug!("fanotify PID 过滤: self_pid={}", self_pid);
 
     let msg_dir = db_dir.join("message");
 
     // 等待 message 目录创建 (轮询, 仅启动时执行一次)
     if !msg_dir.exists() {
-        info!("⏳ 等待 message 目录创建: {}", msg_dir.display());
+        debug!("等待 message 目录创建: {}", msg_dir.display());
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
             if msg_dir.exists() {
-                info!("📁 message 目录已创建");
+                debug!("message 目录已创建");
                 break;
             }
         }
@@ -1117,11 +1117,11 @@ fn wal_watch_loop(db_dir: &Path, tx: tokio::sync::broadcast::Sender<()>) -> Resu
     // 等待 WAL 文件创建 (轮询)
     let wal_path = msg_dir.join("message_0.db-wal");
     if !wal_path.exists() {
-        info!("⏳ 等待 WAL 文件: {}", wal_path.display());
+        debug!("等待 WAL 文件: {}", wal_path.display());
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
             if wal_path.exists() {
-                info!("📄 WAL 文件已创建");
+                debug!("WAL 文件已创建");
                 break;
             }
         }
@@ -1139,8 +1139,8 @@ fn wal_watch_loop(db_dir: &Path, tx: tokio::sync::broadcast::Sender<()>) -> Resu
     fan.add_mountpoint(FanEvent::Modify.into(), &msg_dir)
         .with_context(|| format!("fanotify add_mountpoint 失败: {}", msg_dir.display()))?;
 
-    info!(
-        "👁️ 开始监听 WAL: {} (fanotify FAN_MARK_MOUNT, 无冷却期)",
+    debug!(
+        "开始监听 WAL: {} (fanotify FAN_MARK_MOUNT)",
         wal_path.display()
     );
 

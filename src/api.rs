@@ -27,13 +27,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use utoipa::{OpenApi, ToSchema};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
+use utoipa::{OpenApi, ToSchema};
 
 use crate::atspi::AtSpi;
 use crate::db::DbManager;
@@ -198,7 +198,7 @@ pub fn spawn_input_actor(
     mut rx: tokio::sync::mpsc::Receiver<InputCommand>,
 ) {
     tokio::spawn(async move {
-        info!("🎮 InputEngine actor 已启动");
+        debug!("InputEngine actor 已启动");
         while let Some(cmd) = rx.recv().await {
             metrics.on_dequeue();
             match cmd {
@@ -278,7 +278,7 @@ pub fn spawn_input_actor(
                 }
             }
         }
-        info!("🎮 InputEngine actor 已停止");
+        debug!("InputEngine actor 已停止");
     });
 }
 
@@ -655,10 +655,7 @@ async fn get_screenshot() -> Result<impl IntoResponse, ApiError> {
         .map_err(|e| ApiError::internal(format!("截屏任务失败: {e}")))?
         .map_err(|e| ApiError::internal(format!("截屏失败: {e}")))?;
 
-    Ok((
-        [(axum::http::header::CONTENT_TYPE, "image/png")],
-        png_data,
-    ))
+    Ok(([(axum::http::header::CONTENT_TYPE, "image/png")], png_data))
 }
 
 async fn send_message_inner(

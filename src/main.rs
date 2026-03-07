@@ -185,7 +185,7 @@ async fn main() -> Result<()> {
     let atspi = loop {
         match atspi::AtSpi::connect().await {
             Ok(a) => {
-                info!("✅ AT-SPI2 连接就绪");
+                debug!("AT-SPI2 连接就绪");
                 break Arc::new(a);
             }
             Err(e) => {
@@ -198,7 +198,7 @@ async fn main() -> Result<()> {
     // ③ X11 XTEST 输入引擎 (仅发送消息需要, 非必须)
     let engine = match input::InputEngine::new() {
         Ok(e) => {
-            info!("✅ X11 XTEST 输入引擎就绪");
+            debug!("X11 XTEST 输入引擎就绪");
             Some(e)
         }
         Err(e) => {
@@ -229,7 +229,7 @@ async fn main() -> Result<()> {
     if let Some(eng) = engine {
         api::spawn_input_actor(eng, wechat.clone(), input_metrics.clone(), input_rx);
     } else {
-        warn!("⚠️ X11 输入引擎不可用, InputEngine actor 未启动");
+        debug!("X11 输入引擎不可用, InputEngine actor 未启动");
     }
 
     // ⑥ 创建 AppState (db 使用 OnceLock, 稍后在 DB 就绪时设置)
@@ -274,11 +274,7 @@ async fn main() -> Result<()> {
     // ⑧ 启动 API 服务 (提前启动, /screenshot 和 /status 在登录等待阶段即可用)
     let app = api::build_router(state.clone());
     let addr = std::env::var("MIMICWX_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8899".to_string());
-    info!("🌐 API 服务启动: http://{addr}");
-    info!("📡 WebSocket: ws://{addr}/ws");
-    info!("📌 端点: /status, /screenshot, /contacts, /sessions, /messages/new, /send, /chat, /listen, /ws");
-    info!("📖 API 文档: http://{addr}/docs");
-    info!("🔒 API 认证已启用 (Bearer Token)");
+    info!("🌐 API 服务启动: http://{addr} (文档: /docs, WebSocket: /ws)");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     {
@@ -330,19 +326,18 @@ async fn main() -> Result<()> {
                     let count = hb_atspi.child_count(&registry).await;
                     if count > 0 {
                         if fail_count > 0 {
-                            info!("💓 AT-SPI2 连接恢复 ({count} 个应用)");
+                            info!("AT-SPI2 连接恢复 ({count} 个应用)");
                         }
                         fail_count = 0;
                     } else {
                         fail_count += 1;
-                        warn!("💓 AT-SPI2 心跳异常: Registry 返回 0 个应用 (连续 {fail_count} 次)");
+                        debug!("AT-SPI2 心跳: Registry 返回 0 个应用 (连续 {fail_count} 次)");
                         if fail_count >= 3 {
-                            warn!("💓 连续 3 次异常, 尝试重连...");
+                            warn!("AT-SPI2 连续 {fail_count} 次心跳异常, 尝试重连...");
                             if hb_atspi.reconnect().await {
                                 fail_count = 0;
-                                info!("💓 AT-SPI2 重连成功");
                             } else {
-                                warn!("💓 AT-SPI2 重连失败, 30s 后再试");
+                                warn!("AT-SPI2 重连失败, 30s 后再试");
                             }
                         }
                     }
@@ -417,27 +412,23 @@ async fn main() -> Result<()> {
                     runtime.transition_to(RuntimeState::LoginWaiting).await;
                 }
                 if !login_prompted {
-                    info!("📱 等待扫码登录... (终端二维码 + http://<HOST>:8899/screenshot)");
-                    info!("🔑 GDB 密钥提取已在后台运行, 登录后将自动获取数据库密钥");
+                    info!("📱 等待扫码登录... (二维码: 终端 / http://<HOST>:8899/screenshot)");
                     login_prompted = true;
                 }
 
                 // 尝试从截屏中检测二维码并打印到终端
-                if let Some(qr_content) = tokio::task::spawn_blocking(
-                    input::detect_qr_from_screenshot,
-                )
-                .await
-                .ok()
-                .flatten()
+                if let Some(qr_content) =
+                    tokio::task::spawn_blocking(input::detect_qr_from_screenshot)
+                        .await
+                        .ok()
+                        .flatten()
                 {
                     if last_qr_content.as_ref() != Some(&qr_content) {
                         // 二维码内容变化, 清除旧的并打印新的
                         if qr_lines_printed > 0 {
                             clear_terminal_lines(qr_lines_printed);
                         }
-                        if let Some((rendered, lines)) =
-                            input::render_qr_to_terminal(&qr_content)
-                        {
+                        if let Some((rendered, lines)) = input::render_qr_to_terminal(&qr_content) {
                             eprintln!("\n{rendered}\n  📱 请用微信扫描上方二维码登录\n");
                             qr_lines_printed = lines + 3; // +3: 空行 + 二维码 + 提示行
                         }
@@ -464,14 +455,14 @@ async fn main() -> Result<()> {
             break;
         }
         if i == 0 {
-            info!("🔑 等待 GDB 提取密钥...");
+            debug!("等待 GDB 提取密钥...");
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 
     let db_manager: Option<Arc<db::DbManager>> = match key_provider.get_key().await {
         Ok(key) => {
-            info!("🔑 数据库密钥已获取 ({}...{})", &key[..8], &key[56..]);
+            debug!("数据库密钥已获取 ({}...{})", &key[..8], &key[56..]);
 
             // 查找数据库目录
             let db_dir = find_db_dir();
@@ -690,13 +681,13 @@ fn find_db_dir() -> Option<PathBuf> {
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
         let chosen = &candidates[0].0;
         if candidates.len() > 1 {
-            info!(
-                "📂 发现 {} 个账号目录, 选择最新的: {}",
+            debug!(
+                "发现 {} 个账号目录, 选择最新的: {}",
                 candidates.len(),
                 chosen.display()
             );
         } else {
-            info!("📂 数据库目录: {}", chosen.display());
+            debug!("数据库目录: {}", chosen.display());
         }
         return Some(chosen.clone());
     }
@@ -704,7 +695,7 @@ fn find_db_dir() -> Option<PathBuf> {
     // 也尝试旧路径格式
     let old_path = PathBuf::from("/home/wechat/.local/share/weixin/data/db_storage");
     if old_path.exists() {
-        info!("📂 数据库目录 (旧格式): {}", old_path.display());
+        debug!("数据库目录 (旧格式): {}", old_path.display());
         return Some(old_path);
     }
 
@@ -803,7 +794,11 @@ async fn handle_command(
             let runtime_snapshot = runtime.snapshot().await;
             let status = wechat.check_status().await;
             let listen_list = wechat.get_listen_list().await;
-            let db_status = if db.get().is_some() { "可用" } else { "不可用" };
+            let db_status = if db.get().is_some() {
+                "可用"
+            } else {
+                "不可用"
+            };
             let contacts = if let Some(d) = db.get() {
                 d.get_contacts().await.len()
             } else {
@@ -983,8 +978,7 @@ async fn handle_command(
                     {
                         match reply_rx.await {
                             Ok(Ok((true, _, msg))) => {
-                                let verified = if let (Some(db), Some(rx)) = (db.get(), sent_rx)
-                                {
+                                let verified = if let (Some(db), Some(rx)) = (db.get(), sent_rx) {
                                     db.verify_sent(text, rx).await.unwrap_or(false)
                                 } else {
                                     wechat.verify_sent_after_send(to, text).await

@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, warn};
 
 use crate::atspi::{AtSpi, NodeRef, SearchAction};
 use crate::input::InputEngine;
@@ -38,7 +38,7 @@ impl ChatWnd {
     ///
     /// `window_node` 应该是 AT-SPI2 树中该独立窗口的 frame 节点
     pub fn new(who: String, atspi: Arc<AtSpi>, search_root: NodeRef, window_node: NodeRef) -> Self {
-        info!("📌 创建 ChatWnd: {who}");
+        debug!("ChatWnd 创建: {who}");
         let window_fp = NodeFingerprint::new(["frame"], NameMatch::Contains(who.clone()));
         let edit_fp = NodeFingerprint::new(["entry", "text"], NameMatch::Any);
         let msg_list_fp = NodeFingerprint::new(
@@ -104,10 +104,10 @@ impl ChatWnd {
             )
             .await
         {
-            info!("📌 [ChatWnd] 缓存输入框节点: {}", self.who);
+            debug!("[ChatWnd] 缓存输入框: {}", self.who);
             self.edit_box_node.rebind(node);
         } else {
-            info!("📌 [ChatWnd] 未找到输入框, 将使用偏移量方案: {}", self.who);
+            debug!("[ChatWnd] 未找到输入框, 使用偏移量方案: {}", self.who);
         }
     }
 
@@ -143,10 +143,10 @@ impl ChatWnd {
             )
             .await
         {
-            info!("📌 [ChatWnd] 缓存消息列表节点: {}", self.who);
+            debug!("[ChatWnd] 缓存消息列表: {}", self.who);
             self.msg_list_node.rebind(node);
         } else {
-            info!("📌 [ChatWnd] 未找到消息列表: {}", self.who);
+            warn!("[ChatWnd] 未找到消息列表: {}", self.who);
         }
     }
 
@@ -181,7 +181,7 @@ impl ChatWnd {
         text: &str,
         skip_verify: bool,
     ) -> Result<(bool, bool, String)> {
-        info!("📤 [ChatWnd] 发送: [{}] → {text}", self.who);
+        debug!("[ChatWnd] 发送: [{}] text_len={}", self.who, text.len());
 
         // 1. 激活窗口并聚焦输入框
         self.activate_and_focus_input(engine).await?;
@@ -210,7 +210,7 @@ impl ChatWnd {
         } else {
             "消息已发送 (未验证)"
         };
-        info!("✅ [ChatWnd] 完成: [{}] verified={verified}", self.who);
+        debug!("[ChatWnd] 发送完成: [{}] verified={verified}", self.who);
         Ok((true, verified, msg.into()))
     }
 
@@ -223,7 +223,7 @@ impl ChatWnd {
         engine: &mut InputEngine,
         image_path: &str,
     ) -> Result<(bool, bool, String)> {
-        info!("🖼️ [ChatWnd] 发送图片: [{}] → {image_path}", self.who);
+        debug!("[ChatWnd] 发送图片: [{}] → {image_path}", self.who);
 
         // 1. 激活窗口并聚焦输入框
         self.activate_and_focus_input(engine).await?;
@@ -236,7 +236,7 @@ impl ChatWnd {
         engine.press_enter().await?;
         tokio::time::sleep(ms(500)).await;
 
-        info!("✅ [ChatWnd] 图片发送完成: [{}]", self.who);
+        debug!("[ChatWnd] 图片发送完成: [{}]", self.who);
         Ok((true, false, "图片已发送 (独立窗口)".into()))
     }
 

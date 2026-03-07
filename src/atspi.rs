@@ -88,7 +88,7 @@ impl AtSpi {
         // 最终回退: 标准连接 (可能后续 WeChat 启动后会注册上来)
         let a11y = atspi::AccessibilityConnection::new().await?;
         let conn = a11y.connection().clone();
-        info!("🔗 AT-SPI2 连接就绪 (标准发现, 等待应用注册)");
+        debug!("AT-SPI2 连接就绪 (标准发现, 等待应用注册)");
         Ok(Self {
             conn: RwLock::new(conn),
         })
@@ -106,7 +106,7 @@ impl AtSpi {
             if !addr.is_empty() {
                 debug!("尝试 AT_SPI_BUS_ADDRESS: {addr}");
                 if let Some(instance) = Self::connect_to_address(&addr).await {
-                    info!("🔗 AT-SPI2 连接就绪 (AT_SPI_BUS_ADDRESS)");
+                    debug!("AT-SPI2 连接就绪 (AT_SPI_BUS_ADDRESS)");
                     return Some(instance);
                 }
             }
@@ -121,7 +121,7 @@ impl AtSpi {
             if let Some(root) = Self::registry() {
                 let count = instance.child_count(&root).await;
                 if count > 1 {
-                    info!("🔗 AT-SPI2 连接就绪 (标准发现, {count} 个应用)");
+                    debug!("AT-SPI2 连接就绪 (标准发现, {count} 个应用)");
                     return Some(instance);
                 }
                 debug!("标准连接只有 {count} 个子节点");
@@ -130,7 +130,7 @@ impl AtSpi {
 
         // 方法4: 扫描 socket 文件
         if let Some(instance) = Self::scan_bus_sockets().await {
-            info!("🔗 AT-SPI2 连接就绪 (扫描发现)");
+            debug!("AT-SPI2 连接就绪 (扫描发现)");
             return Some(instance);
         }
 
@@ -180,7 +180,7 @@ impl AtSpi {
             return None;
         }
 
-        info!("发现 AT-SPI2 bus 地址: {addr}");
+        debug!("发现 AT-SPI2 bus 地址: {addr}");
         Self::connect_to_address(&addr).await
     }
 
@@ -221,7 +221,7 @@ impl AtSpi {
             let count = instance.child_count(&root).await;
             debug!("  bus {socket_path} 有 {count} 个子节点");
             if count > 0 {
-                info!("🔗 找到有效 AT-SPI2 bus: {socket_path} ({count} 个应用)");
+                debug!("找到有效 AT-SPI2 bus: {socket_path} ({count} 个应用)");
                 return Some(instance);
             }
         }
@@ -235,7 +235,7 @@ impl AtSpi {
     ///
     /// 当 Registry 持续返回 0 个子节点时调用此方法。
     pub async fn reconnect(&self) -> bool {
-        info!("🔄 尝试重新发现 AT-SPI2 bus...");
+        debug!("尝试重新发现 AT-SPI2 bus...");
 
         // 尝试通过 org.a11y.Bus 获取最新地址
         if let Some(new_conn) = Self::connect_via_a11y_bus().await {
@@ -249,7 +249,7 @@ impl AtSpi {
                 if count > 0 {
                     let mut conn = self.conn.write().await;
                     *conn = new_inner;
-                    info!("🔄 重连成功 (org.a11y.Bus, {count} 个应用)");
+                    info!("AT-SPI2 重连成功 ({count} 个应用)");
                     return true;
                 }
             }
@@ -260,7 +260,7 @@ impl AtSpi {
             let new_inner = new_conn.conn.read().await.clone();
             let mut conn = self.conn.write().await;
             *conn = new_inner;
-            info!("🔄 重连成功 (socket 扫描)");
+            info!("AT-SPI2 重连成功 (socket 扫描)");
             return true;
         }
 
@@ -315,7 +315,7 @@ impl AtSpi {
             if let Some(root) = Self::registry() {
                 let count = instance.child_count(&root).await;
                 if count > 1 {
-                    info!("🔗 找到有效 AT-SPI2 bus: {path_str} ({count} 个应用)");
+                    debug!("找到有效 AT-SPI2 bus: {path_str} ({count} 个应用)");
                     return Some(instance);
                 }
                 debug!("  bus {path_str} 只有 {count} 个子节点, 跳过");

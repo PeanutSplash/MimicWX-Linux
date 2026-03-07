@@ -67,7 +67,7 @@ pub struct InputEngine {
 impl InputEngine {
     /// 创建输入引擎
     pub fn new() -> Result<Self> {
-        info!("🎮 初始化 X11 XTEST 输入引擎...");
+        debug!("初始化 X11 XTEST 输入引擎...");
 
         let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
         let (conn, screen_num) = RustConnection::connect(Some(&display_env))
@@ -104,7 +104,7 @@ impl InputEngine {
             .atom;
         let atom_net_close_window = conn.intern_atom(false, b"_NET_CLOSE_WINDOW")?.reply()?.atom;
 
-        info!("✅ X11 XTEST 就绪 (DISPLAY={display_env}, keycodes={min_keycode}~{max_keycode})");
+        debug!("X11 XTEST 就绪 (DISPLAY={display_env}, keycodes={min_keycode}~{max_keycode})");
 
         Ok(Self {
             conn,
@@ -294,7 +294,7 @@ impl InputEngine {
     }
 
     async fn clipboard_paste(&mut self, text: &str) -> Result<()> {
-        info!("📋 粘贴文本: {} 字符", text.len());
+        debug!("粘贴文本: {} 字符", text.len());
         let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
         let mut last_error = None;
 
@@ -494,7 +494,7 @@ impl InputEngine {
 
     /// 通过剪贴板粘贴图片文件 (xclip + Ctrl+V)
     pub async fn paste_image(&mut self, image_path: &str) -> Result<()> {
-        info!("🖼️ 粘贴图片: {}", image_path);
+        debug!("粘贴图片: {}", image_path);
 
         // 检测 MIME 类型
         let mime = if image_path.ends_with(".png") {
@@ -804,7 +804,7 @@ impl InputEngine {
     pub fn close_window_by_title(&self, title: &str) -> Result<bool> {
         let windows = self.find_windows_by_title(title, false)?;
         if let Some((win, name)) = windows.first() {
-            info!("🗑️ 关闭窗口: '{name}' (匹配 '{title}')");
+            debug!("关闭窗口: '{name}' (匹配 '{title}')");
             let close_atom = self.atom_net_close_window;
             let event = ClientMessageEvent {
                 response_type: xproto::CLIENT_MESSAGE_EVENT,
@@ -863,7 +863,11 @@ pub fn capture_screenshot() -> Result<Vec<u8>> {
             .get_image(xproto::ImageFormat::Z_PIXMAP, root, 0, 0, w, h, !0)?
             .reply()
             .context("X11 GetImage 失败")?;
-        captures.push((bgr_to_rgb(&image.data, w as u32, h as u32, bpp), w as u32, h as u32));
+        captures.push((
+            bgr_to_rgb(&image.data, w as u32, h as u32, bpp),
+            w as u32,
+            h as u32,
+        ));
     } else {
         for (win, name, w, h) in &wechat_wins {
             if let Some(image) = conn
@@ -872,7 +876,11 @@ pub fn capture_screenshot() -> Result<Vec<u8>> {
                 .and_then(|c| c.reply().ok())
             {
                 debug!("📸 截取窗口: '{}' 0x{:x} {}x{}", name, win, w, h);
-                captures.push((bgr_to_rgb(&image.data, *w as u32, *h as u32, bpp), *w as u32, *h as u32));
+                captures.push((
+                    bgr_to_rgb(&image.data, *w as u32, *h as u32, bpp),
+                    *w as u32,
+                    *h as u32,
+                ));
             } else {
                 debug!("📸 截取窗口失败: '{}'", name);
             }
@@ -910,12 +918,18 @@ pub fn capture_screenshot() -> Result<Vec<u8>> {
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().context("PNG header 写入失败")?;
-        writer.write_image_data(&canvas).context("PNG 数据写入失败")?;
+        writer
+            .write_image_data(&canvas)
+            .context("PNG 数据写入失败")?;
     }
 
     debug!(
         "📸 截屏完成: {}x{} ({} 个窗口) depth={} → {} bytes PNG",
-        total_w, total_h, captures.len(), depth, png_buf.len()
+        total_w,
+        total_h,
+        captures.len(),
+        depth,
+        png_buf.len()
     );
     Ok(png_buf)
 }
@@ -929,7 +943,7 @@ fn bgr_to_rgb(data: &[u8], w: u32, h: u32, bpp: usize) -> Vec<u8> {
         if offset + 2 < data.len() {
             rgb.push(data[offset + 2]); // R
             rgb.push(data[offset + 1]); // G
-            rgb.push(data[offset]);      // B
+            rgb.push(data[offset]); // B
         } else {
             rgb.extend_from_slice(&[0, 0, 0]);
         }
@@ -945,10 +959,7 @@ fn bgr_to_rgb(data: &[u8], w: u32, h: u32, bpp: usize) -> Vec<u8> {
 /// - 包含 "WeChatAppEx" (微信内嵌浏览器)
 /// - 同进程的无名窗口 (通过 _NET_WM_PID 关联)
 /// - 过滤掉面积过小的辅助窗口 (< 50x50)
-fn find_wechat_windows(
-    conn: &RustConnection,
-    root: u32,
-) -> Vec<(u32, String, u16, u16)> {
+fn find_wechat_windows(conn: &RustConnection, root: u32) -> Vec<(u32, String, u16, u16)> {
     let atoms = match intern_screenshot_atoms(conn) {
         Some(a) => a,
         None => return vec![],
@@ -1036,9 +1047,24 @@ fn is_wechat_name(name: &str) -> bool {
 
 /// intern 截屏所需的 X11 Atom: (_NET_CLIENT_LIST, _NET_WM_NAME, UTF8_STRING)
 fn intern_screenshot_atoms(conn: &RustConnection) -> Option<(u32, u32, u32)> {
-    let a = conn.intern_atom(false, b"_NET_CLIENT_LIST").ok()?.reply().ok()?.atom;
-    let b = conn.intern_atom(false, b"_NET_WM_NAME").ok()?.reply().ok()?.atom;
-    let c = conn.intern_atom(false, b"UTF8_STRING").ok()?.reply().ok()?.atom;
+    let a = conn
+        .intern_atom(false, b"_NET_CLIENT_LIST")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let b = conn
+        .intern_atom(false, b"_NET_WM_NAME")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let c = conn
+        .intern_atom(false, b"UTF8_STRING")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
     Some((a, b, c))
 }
 
@@ -1051,7 +1077,8 @@ fn get_client_list(conn: &RustConnection, root: u32, atom: u32) -> Option<Vec<u3
         .ok()?;
     if reply.format == 32 && !reply.value.is_empty() {
         Some(
-            reply.value
+            reply
+                .value
                 .chunks_exact(4)
                 .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
@@ -1067,14 +1094,26 @@ fn get_wm_class(conn: &RustConnection, win: u32, wm_class_atom: u32) -> Option<S
         return None;
     }
     let reply = conn
-        .get_property(false, win, wm_class_atom, u32::from(AtomEnum::STRING), 0, 256)
+        .get_property(
+            false,
+            win,
+            wm_class_atom,
+            u32::from(AtomEnum::STRING),
+            0,
+            256,
+        )
         .ok()?
         .reply()
         .ok()?;
     if reply.value.is_empty() {
         return None;
     }
-    Some(String::from_utf8_lossy(&reply.value).replace('\0', " ").trim().to_string())
+    Some(
+        String::from_utf8_lossy(&reply.value)
+            .replace('\0', " ")
+            .trim()
+            .to_string(),
+    )
 }
 
 /// 获取 _NET_WM_PID
@@ -1089,7 +1128,10 @@ fn get_window_pid(conn: &RustConnection, win: u32, pid_atom: u32) -> Option<u32>
         .ok()?;
     if reply.format == 32 && reply.value.len() >= 4 {
         Some(u32::from_ne_bytes([
-            reply.value[0], reply.value[1], reply.value[2], reply.value[3],
+            reply.value[0],
+            reply.value[1],
+            reply.value[2],
+            reply.value[3],
         ]))
     } else {
         None
