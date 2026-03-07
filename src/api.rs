@@ -458,7 +458,7 @@ impl utoipa::Modify for SecurityAddon {
         get_contacts, get_new_messages, get_sessions,
         send_message, send_image, chat_with,
         get_listen_list, add_listen, remove_listen,
-        get_tree, get_session_tree, exec_command,
+        get_tree, get_node_tree, get_session_tree, exec_command,
     ),
     components(schemas(
         StatusResponse, RuntimeSnapshot, InputMetricsSnapshot,
@@ -492,6 +492,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/listen", delete(remove_listen))
         .route("/command", post(exec_command))
         .route("/debug/tree", get(get_tree))
+        .route("/debug/node", get(get_node_tree))
         .route("/debug/sessions", get(get_session_tree))
         .route("/ws", get(ws_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer));
@@ -1058,9 +1059,17 @@ async fn get_listen_list(State(state): State<Arc<AppState>>) -> impl IntoRespons
     get, path = "/debug/tree",
     tag = "Debug",
     summary = "AT-SPI2 控件树",
-    description = "导出微信应用的 AT-SPI2 无障碍控件树, 用于调试和开发。\n\n返回嵌套的控件节点数组, 包含角色、名称、状态等属性。可通过 `depth` 参数控制遍历深度。",
+    description = "导出微信应用的 AT-SPI2 无障碍控件树, 用于调试和 AI 辅助开发。\n\n返回控件节点数组, 包含角色、名称等属性。可通过查询参数控制遍历深度和输出内容。\n\n## 参数\n- `depth` — 最大树深度 (默认 5, 最大 25)\n- `max_nodes` — 最大节点数 (默认 200, 最大 1000)\n- `bbox` — 是否输出坐标 (true/false, 默认 false)\n- `states` — 是否输出状态 (true/false, 默认 false)\n- `path` — 是否输出 AT-SPI2 路径 (true/false, 默认 false)\n- `all` — 同时开启 bbox + states + path (true/false)\n- `skip_msg_list` — 是否跳过消息列表子节点 (默认 true)",
     security(("bearer" = [])),
-    params(("depth" = Option<u32>, Query, description = "最大树深度 (默认 5, 最大 15)")),
+    params(
+        ("depth" = Option<u32>, Query, description = "最大树深度 (默认 5, 最大 25)"),
+        ("max_nodes" = Option<u32>, Query, description = "最大节点数 (默认 200, 最大 1000)"),
+        ("bbox" = Option<bool>, Query, description = "输出坐标"),
+        ("states" = Option<bool>, Query, description = "输出状态"),
+        ("path" = Option<bool>, Query, description = "输出 AT-SPI2 路径"),
+        ("all" = Option<bool>, Query, description = "同时开启 bbox + states + path"),
+        ("skip_msg_list" = Option<bool>, Query, description = "跳过消息列表子节点 (默认 true)"),
+    ),
     responses(
         (status = 200, description = "控件树节点数组 (微信未运行时返回空数组)"),
         (status = 401, description = "未授权 — Token 缺失或不匹配")
@@ -1070,17 +1079,57 @@ async fn get_tree(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let max_depth = params
-        .get("depth")
-        .and_then(|d| d.parse::<u32>().ok())
-        .unwrap_or(5)
-        .min(15);
+    let opts = parse_dump_options(&params);
     if let Some(app) = state.wechat.find_app().await {
-        let tree = state.atspi.dump_tree(&app, max_depth).await;
+        let tree = state.atspi.dump_tree_ext(&app, &opts).await;
         Json(tree)
     } else {
         Json(vec![])
     }
+}
+
+#[utoipa::path(
+    get, path = "/debug/node",
+    tag = "Debug",
+    summary = "AT-SPI2 子树查询",
+    description = "从指定的 AT-SPI2 节点开始导出子树。\n\n需要提供 `bus` 和 `node_path` 参数 (可从 `/debug/tree?path=true` 的输出中获取)。\n支持与 `/debug/tree` 相同的 depth/bbox/states/path 等参数。",
+    security(("bearer" = [])),
+    params(
+        ("bus" = String, Query, description = "AT-SPI2 bus name"),
+        ("node_path" = String, Query, description = "AT-SPI2 object path"),
+        ("depth" = Option<u32>, Query, description = "最大树深度 (默认 5, 最大 25)"),
+        ("max_nodes" = Option<u32>, Query, description = "最大节点数 (默认 200, 最大 1000)"),
+        ("bbox" = Option<bool>, Query, description = "输出坐标"),
+        ("states" = Option<bool>, Query, description = "输出状态"),
+        ("path" = Option<bool>, Query, description = "输出 AT-SPI2 路径"),
+        ("all" = Option<bool>, Query, description = "同时开启 bbox + states + path"),
+        ("skip_msg_list" = Option<bool>, Query, description = "跳过消息列表子节点 (默认 true)"),
+    ),
+    responses(
+        (status = 200, description = "子树节点数组"),
+        (status = 400, description = "缺少 bus 或 node_path 参数"),
+        (status = 401, description = "未授权 — Token 缺失或不匹配")
+    )
+)]
+async fn get_node_tree(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let bus = match params.get("bus") {
+        Some(b) => b.as_str(),
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing 'bus' param"}))).into_response(),
+    };
+    let node_path = match params.get("node_path") {
+        Some(p) => p.as_str(),
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing 'node_path' param"}))).into_response(),
+    };
+    let node = match AtSpi::node_from_path(bus, node_path) {
+        Some(n) => n,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid path"}))).into_response(),
+    };
+    let opts = parse_dump_options(&params);
+    let tree = state.atspi.dump_tree_ext(&node, &opts).await;
+    Json(tree).into_response()
 }
 
 #[utoipa::path(
@@ -1102,6 +1151,19 @@ async fn get_session_tree(State(state): State<Arc<AppState>>) -> impl IntoRespon
         }
     }
     Json(vec![])
+}
+
+/// 解析 dump_tree 的查询参数为 DumpOptions
+fn parse_dump_options(params: &HashMap<String, String>) -> crate::atspi::DumpOptions {
+    let all = params.get("all").map(|v| v == "true" || v == "1").unwrap_or(false);
+    crate::atspi::DumpOptions {
+        max_depth: params.get("depth").and_then(|d| d.parse().ok()).unwrap_or(5).min(25),
+        max_nodes: params.get("max_nodes").and_then(|d| d.parse().ok()).unwrap_or(200).min(1000),
+        include_bbox: all || params.get("bbox").map(|v| v == "true" || v == "1").unwrap_or(false),
+        include_states: all || params.get("states").map(|v| v == "true" || v == "1").unwrap_or(false),
+        include_path: all || params.get("path").map(|v| v == "true" || v == "1").unwrap_or(false),
+        skip_message_list: params.get("skip_msg_list").map(|v| v != "false" && v != "0").unwrap_or(true),
+    }
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {

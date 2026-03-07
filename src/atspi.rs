@@ -40,7 +40,7 @@ pub struct NodeRef {
 }
 
 /// 控件坐标 (屏幕像素)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct BBox {
     pub x: i32,
     pub y: i32,
@@ -61,6 +61,40 @@ pub struct TreeNode {
     pub role: String,
     pub name: String,
     pub children: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<BBox>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub states: Option<Vec<String>>,
+    /// AT-SPI2 object path (用于子树查询)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// AT-SPI2 bus name (用于子树查询)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bus: Option<String>,
+}
+
+/// dump_tree 的可选参数
+pub struct DumpOptions {
+    pub max_depth: u32,
+    pub max_nodes: u32,
+    pub include_bbox: bool,
+    pub include_states: bool,
+    pub include_path: bool,
+    /// 是否跳过消息列表子节点 (默认 true)
+    pub skip_message_list: bool,
+}
+
+impl Default for DumpOptions {
+    fn default() -> Self {
+        Self {
+            max_depth: 5,
+            max_nodes: 200,
+            include_bbox: false,
+            include_states: false,
+            include_path: false,
+            skip_message_list: true,
+        }
+    }
 }
 
 // =====================================================================
@@ -624,10 +658,14 @@ impl AtSpi {
 
     /// 导出 AT-SPI2 树（调试用，限制 200 节点）
     pub async fn dump_tree(&self, root: &NodeRef, max_depth: u32) -> Vec<TreeNode> {
+        self.dump_tree_ext(root, &DumpOptions { max_depth, ..Default::default() }).await
+    }
+
+    /// 导出 AT-SPI2 树（增强版，支持 bbox/states/path 等选项）
+    pub async fn dump_tree_ext(&self, root: &NodeRef, opts: &DumpOptions) -> Vec<TreeNode> {
         let mut nodes = Vec::new();
         let mut count = 0u32;
-        self.dump_dfs(root, 0, max_depth, &mut nodes, &mut count)
-            .await;
+        self.dump_dfs(root, 0, opts, &mut nodes, &mut count).await;
         nodes
     }
 
@@ -635,12 +673,12 @@ impl AtSpi {
         &'a self,
         node: &'a NodeRef,
         depth: u32,
-        max_depth: u32,
+        opts: &'a DumpOptions,
         out: &'a mut Vec<TreeNode>,
         count: &'a mut u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            if depth > max_depth || *count >= 200 {
+            if depth > opts.max_depth || *count >= opts.max_nodes {
                 return;
             }
             *count += 1;
@@ -649,28 +687,86 @@ impl AtSpi {
             let name = self.name(node).await;
             let children = self.child_count(node).await;
 
+            let bbox = if opts.include_bbox {
+                self.bbox(node).await
+            } else {
+                None
+            };
+
+            let states = if opts.include_states {
+                Some(Self::decode_states(self.get_states(node).await))
+            } else {
+                None
+            };
+
+            let (path, bus) = if opts.include_path {
+                (Some(node.path.to_string()), Some(node.bus.clone()))
+            } else {
+                (None, None)
+            };
+
             out.push(TreeNode {
                 depth,
                 role: role.clone(),
                 name: name.clone(),
                 children,
+                bbox,
+                states,
+                path,
+                bus,
             });
 
-            // 消息列表不递归
-            if role == "list" && (name.contains("消息") || name.contains("Messages")) {
+            // 消息列表不递归 (除非显式关闭)
+            if opts.skip_message_list
+                && role == "list"
+                && (name.contains("消息") || name.contains("Messages"))
+            {
                 return;
             }
 
-            for i in 0..children.min(20) {
-                if *count >= 200 {
+            for i in 0..children.min(30) {
+                if *count >= opts.max_nodes {
                     return;
                 }
                 if let Some(child) = self.child_at(node, i).await {
-                    self.dump_dfs(&child, depth + 1, max_depth, out, count)
-                        .await;
+                    self.dump_dfs(&child, depth + 1, opts, out, count).await;
                 }
             }
         })
+    }
+
+    /// 通过 bus_name + object_path 定位节点
+    pub fn node_from_path(bus: &str, path: &str) -> Option<NodeRef> {
+        Some(NodeRef {
+            bus: bus.to_string(),
+            path: path.try_into().ok()?,
+        })
+    }
+
+    /// 解码 AT-SPI2 状态位为可读字符串
+    fn decode_states(bits: u64) -> Vec<String> {
+        const STATE_NAMES: &[(u64, &str)] = &[
+            (1 << 1, "active"),
+            (1 << 4, "checked"),
+            (1 << 6, "editable"),
+            (1 << 7, "enabled"),
+            (1 << 8, "expandable"),
+            (1 << 9, "expanded"),
+            (1 << 10, "focusable"),
+            (1 << 11, "focused"),
+            (1 << 17, "multiselectable"),
+            (1 << 19, "opaque"),
+            (1 << 22, "selectable"),
+            (1 << 25, "selected"),
+            (1 << 26, "sensitive"),
+            (1 << 28, "showing"),
+            (1 << 30, "visible"),
+        ];
+        STATE_NAMES
+            .iter()
+            .filter(|(mask, _)| bits & mask != 0)
+            .map(|(_, name)| (*name).to_string())
+            .collect()
     }
 
     // =================================================================
