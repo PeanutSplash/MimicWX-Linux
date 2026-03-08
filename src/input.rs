@@ -4,7 +4,7 @@
 //! 中文输入通过 X11 Selection（剪贴板）+ Ctrl+V 实现。图片通过 xclip + Ctrl+V。
 
 use anyhow::{Context, Result};
-use tracing::{debug, info};
+use tracing::debug;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     self, AtomEnum, ClientMessageEvent, ConnectionExt as _, EventMask, Keycode,

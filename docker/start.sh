@@ -1,6 +1,6 @@
 #!/bin/bash
 # MimicWX-Linux 容器启动脚本
-# 启动顺序: D-Bus → X11/WM → AT-SPI2 → WeChat → GDB密钥提取 → MimicWX
+# 启动顺序: D-Bus → X11/WM → AT-SPI2 → WeChat → MimicWX(进程内扫描密钥)
 
 set +e  # 不因单个命令失败而退出
 
@@ -22,7 +22,7 @@ fi
 mkdir -p /run/dbus
 dbus-daemon --system --fork 2>/dev/null || true
 
-# 允许 ptrace (GDB 密钥提取需要)
+# 允许 ptrace (MimicWX 进程内存扫描需要)
 echo 0 > /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || true
 
 # 修复权限
@@ -43,30 +43,6 @@ if [ "$MIMICWX_DEBUG" = "1" ]; then
     echo "mimicwx" | vncpasswd -f > ~/.vnc/passwd
     chmod 600 ~/.vnc/passwd
   '
-fi
-
-# ============================================================
-# GDB 密钥提取监视器 (root 后台)
-# 等待 WeChat PID 文件出现后自动 attach 提取密钥
-# ============================================================
-if [ ! -f /tmp/wechat_key.txt ]; then
-  setsid bash -c '
-    echo "[GDB] 密钥提取监视器启动, 等待 WeChat PID..."
-    for _i in $(seq 1 90); do
-      [ -f /tmp/wechat.pid ] && break
-      sleep 1
-    done
-    if [ -f /tmp/wechat.pid ]; then
-      WECHAT_PID=$(cat /tmp/wechat.pid)
-      echo "[GDB] 检测到 WeChat (PID: $WECHAT_PID), 开始提取密钥..."
-      sleep 5
-      gdb -batch -nx -p "$WECHAT_PID" -x /usr/local/bin/extract_key.py \
-        > /tmp/gdb_extract.log 2>&1 || true
-      echo "[GDB] 密钥提取完成, 详见 /tmp/gdb_extract.log"
-    else
-      echo "[GDB] ❌ 超时: 未找到 WeChat PID"
-    fi
-  ' &
 fi
 
 # ============================================================
@@ -178,7 +154,7 @@ su - wechat << 'USEREOF'
     echo "[start.sh] ✅ noVNC 已启动 (http://localhost:${NOVNC_PORT}/vnc.html)"
   fi
 
-  # 7) 启动微信 (写 PID 供 GDB 使用, 保留 stderr 日志)
+  # 7) 启动微信 (写 PID 供诊断使用, 保留 stderr 日志)
   echo "[start.sh] 启动微信..."
   wechat --no-sandbox --disable-gpu > /tmp/wechat_stdout.log 2>&1 &
   WECHAT_PID=$!

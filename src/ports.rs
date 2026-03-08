@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -12,12 +11,6 @@ pub struct SendResult {
     pub sent: bool,
     pub verified: bool,
     pub message: String,
-}
-
-#[async_trait::async_trait]
-pub trait KeyProvider: Send + Sync {
-    async fn get_key(&self) -> Result<String>;
-    fn is_ready(&self) -> bool;
 }
 
 #[async_trait::async_trait]
@@ -40,36 +33,6 @@ pub trait SessionLocator: Send + Sync {
     async fn chat_with(&self, who: &str) -> Result<Option<String>>;
     async fn add_listen(&self, who: &str) -> Result<bool>;
     async fn remove_listen(&self, who: &str) -> bool;
-}
-
-pub struct GdbFileKeyProvider {
-    path: PathBuf,
-}
-
-impl GdbFileKeyProvider {
-    pub fn new(path: impl AsRef<Path>) -> Self {
-        Self {
-            path: path.as_ref().to_path_buf(),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl KeyProvider for GdbFileKeyProvider {
-    async fn get_key(&self) -> Result<String> {
-        let key = tokio::fs::read_to_string(&self.path)
-            .await
-            .map_err(|e| anyhow!("读取密钥文件失败 {}: {e}", self.path.display()))?;
-        let key = key.trim().to_string();
-        if key.len() != 64 {
-            return Err(anyhow!("密钥文件格式异常: len={}", key.len()));
-        }
-        Ok(key)
-    }
-
-    fn is_ready(&self) -> bool {
-        self.path.exists()
-    }
 }
 
 #[async_trait::async_trait]

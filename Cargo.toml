@@ -30,8 +30,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Utils
 anyhow = "1"
 async-trait = "0.1"
+hmac = "0.12"
 md5 = "0.7"
+pbkdf2 = "0.12"
 quick-xml = "0.37"
+sha2 = "0.10"
 zstd = "0.13"
 toml = "0.8"
 base64 = "0.22"

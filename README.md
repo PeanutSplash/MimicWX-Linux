@@ -10,7 +10,7 @@
 
 - 🔍 **数据库消息检测** — SQLCipher 解密 WCDB + fanotify WAL 实时监听，亚秒级延迟，支持文本/图片/语音/视频/链接等 13+ 种消息类型解析
 - ⌨️ **X11 原生输入注入** — XTEST 扩展注入键鼠事件 + X11 Selection 协议直接操作剪贴板（零外部进程依赖），原生窗口管理
-- 🔑 **GDB 自动密钥提取** — 在 `setCipherKey` 偏移处设断点，扫码登录后自动从寄存器捕获 32 字节 AES 密钥
+- 🔑 **进程内密钥扫描** — 直接扫描微信进程内存中的 WCDB `enc_key` 候选，并用 page1 HMAC 校验按库确认密钥，无需 GDB 和固定偏移
 - 💬 **独立聊天窗口** — 借鉴 [wxauto](https://github.com/cluic/wxauto) 的 ChatWnd 设计，支持多窗口并行收发 + NodeHandle 缓存自动失效重建
 - 🔌 **REST + JSON-RPC over WebSocket** — 完整 HTTP API + WebSocket 双向通信（JSON-RPC 2.0 请求/响应 + 实时事件推送），CORS 全开放，可对接 Yunzai 等机器人框架
 - 📸 **截图 + 终端二维码** — X11 截屏微信窗口（多窗口自动拼接），登录时终端自动渲染二维码，无需 VNC 即可扫码
@@ -18,7 +18,7 @@
 - 🔒 **Token 认证** — 支持 Bearer Token 认证保护 API 安全
 - 🖥️ **交互式控制台** — 支持 `/restart`、`/stop`、`/status`、`/refresh`、`/help` 命令，方向键切换历史
 - 💡 **自动弹性** — AT-SPI2 心跳自动重连、联系人定时刷新、优雅重启/关闭
-- 🔄 **运行时状态机** — 显式 RuntimeState（Booting → DesktopReady → WeChatReady → LoginWaiting → KeyReady → DbReady → Serving），异常进入 Degraded 而非 panic
+- 🔄 **运行时状态机** — 显式 RuntimeState（Booting → DesktopReady → WeChatReady → LoginWaiting → KeyReady → DbReady → Serving），其中 `KeyReady` 表示关键数据库密钥已扫描并验证，异常进入 Degraded 而非 panic
 - 📊 **输入层可观测** — 队列深度、命令耗时、剪贴板失败、焦点丢失等关键指标实时暴露
 
 ---
@@ -38,13 +38,14 @@
 │  │                                                                       │ │
 │  │  ┌── 运行时层 ──────────────────────────────────────────────────┐     │ │
 │  │  │  runtime.rs: RuntimeState 状态机驱动启动 + 广播状态变更       │     │ │
-│  │  │  ports.rs:   Ports/Adapters 抽象 (KeyProvider / MessageSource │     │ │
-│  │  │              / MessageSender / SessionLocator)                │     │ │
+│  │  │  ports.rs:   Ports/Adapters 抽象 (MessageSource /             │     │ │
+│  │  │              MessageSender / SessionLocator)                  │     │ │
 │  │  └──────────────────────────────────────────────────────────────┘     │ │
 │  │                                                                       │ │
 │  │  ┌── 消息检测层 ────────────────────────────────────────────────┐     │ │
-│  │  │  db.rs:    SQLCipher 解密 → fanotify WAL 监听 → 增量消息拉取 │     │ │
-│  │  │  atspi.rs: D-Bus → AT-SPI2 Registry → 节点遍历/属性读取      │     │ │
+│  │  │  keyscan.rs: /proc 内存扫描 → HMAC 校验 → 按库密钥注册表     │     │ │
+│  │  │  db.rs:      SQLCipher 解密 → fanotify WAL 监听 → 增量消息拉取│     │ │
+│  │  │  atspi.rs:   D-Bus → AT-SPI2 Registry → 节点遍历/属性读取     │     │ │
 │  │  └──────────────────────────────────────────────────────────────┘     │ │
 │  │                                                                       │ │
 │  │  ┌── 输入控制层 ────────────────────────────────────────────────┐     │ │
@@ -66,7 +67,6 @@
 │                                                                           │
 │  ┌─ 辅助脚本 ────────────────────────────────────────────────────────────┐ │
 │  │  start.sh:       容器启动编排 (D-Bus → X11 → AT-SPI2 → 微信 → 服务) │ │
-│  │  extract_key.py: GDB Python 脚本 — 自动提取 WCDB 加密密钥          │ │
 │  └──────────────────────────────────────────────────────────────────────┘ │
 └───────────────────────────────────────────────────────────────────────────┘
 
@@ -91,11 +91,11 @@ MimicWX-Linux/
 │   ├── node_handle.rs          # AT-SPI 节点句柄 (指纹匹配 + 缓存失效重定位)
 │   ├── wechat.rs               # 微信业务逻辑 (会话管理、消息发送/验证)
 │   ├── chatwnd.rs              # 独立聊天窗口 (ChatWnd 模式)
+│   ├── keyscan.rs              # 微信进程内存扫描 + 按库密钥注册表
 │   ├── db.rs                   # 数据库监听 (SQLCipher + fanotify WAL)
 │   └── api.rs                  # HTTP/WebSocket API (axum + JSON-RPC 2.0)
 ├── docker/
 │   ├── start.sh                # 容器启动脚本 (headless/debug 双模式)
-│   ├── extract_key.py          # GDB 密钥提取脚本
 │   └── dbus-mimicwx.conf       # D-Bus 配置 (允许 eavesdrop)
 ├── adapter/
 │   └── MimicWX.js              # Yunzai-Bot 适配器
@@ -119,7 +119,7 @@ MimicWX-Linux/
 | `DesktopReady` | X11 + AT-SPI2 连接就绪 |
 | `WeChatReady` | 微信进程已启动，窗口可见 |
 | `LoginWaiting` | 等待扫码登录 |
-| `KeyReady` | GDB 密钥提取成功 |
+| `KeyReady` | 关键数据库密钥已从微信进程内存扫描并验证完成 |
 | `DbReady` | DbManager 初始化完成，联系人已加载 |
 | `Serving` | 全功能服务中 |
 | `Degraded(reason)` | 部分功能不可用（附原因） |
@@ -128,14 +128,26 @@ MimicWX-Linux/
 
 ### `ports.rs` — Ports/Adapters 抽象
 
-定义业务边界 trait，将基础设施与业务逻辑解耦：
+定义业务边界 trait，将消息源、发送器和会话定位能力与业务逻辑解耦：
 
 | Port (trait) | Adapter (实现) | 职责 |
 |-------------|---------------|------|
-| `KeyProvider` | `GdbFileKeyProvider` | 读取 GDB 提取的密钥文件 |
 | `MessageSource` | `WcdbMessageSource` (db.rs) | 数据库增量消息 + fanotify 监听 |
 | `MessageSender` | `ActorPort` | AT-SPI + X11 发送消息/图片 |
 | `SessionLocator` | `ActorPort` | 会话切换 / 监听管理 |
+
+### `keyscan.rs` — 进程内密钥解析
+
+微信登录后，`mimicwx` 直接扫描运行中微信进程的可读内存区域，构建按库密钥注册表：
+
+| 能力 | 说明 |
+|------|------|
+| **数据库目录枚举** | 遍历 `db_storage/**/*.db`，读取 page1 + salt，构建 `DbCatalog` |
+| **进程扫描** | 读取 `/proc/<pid>/maps` + `/proc/<pid>/mem`，扫描微信相关进程的可读区域 |
+| **候选匹配** | 查找 `x'<64hex><32hex>'`、`x'<64hex>'` 等 WCDB `enc_key` 缓存模式 |
+| **HMAC 校验** | 用 SQLCipher page1 的 HMAC-SHA512 校验候选 `enc_key` 真伪 |
+| **按库注册** | 输出 `KeyRegistry`，为每个相对路径数据库保存已验证 `enc_key` |
+| **提前收敛** | 优先保证 `contact.db`、`session.db`、`message_*.db` 可用，其他库可延后 |
 
 ### `events.rs` — 类型化事件
 
@@ -192,7 +204,7 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 
 | 能力 | 说明 |
 |------|------|
-| **SQLCipher 解密** | `rusqlite` + `bundled-sqlcipher-vendored-openssl`，使用 GDB 提取的密钥 |
+| **SQLCipher 解密** | `rusqlite` + `bundled-sqlcipher-vendored-openssl`，按数据库从 `KeyRegistry` 取已验证 `enc_key`，结合 page1 salt 以 raw-key 形式开库 |
 | **持久连接池** | 多个 `message_N.db` 保持长连接，避免重复解密握手 |
 | **WAL 监听** | `fanotify` + PID 过滤 (只监听微信进程写入)，无需防抖 |
 | **增量消息** | 每个消息表维护 `last_local_id` 高水位标记 |
@@ -274,7 +286,7 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 
 - Linux x86_64 系统 (Ubuntu 22.04+ 推荐)，或可运行 x86_64 容器的主机
 - Docker + Docker Compose
-- 允许 `SYS_ADMIN` / `SYS_PTRACE` 能力 (密钥提取 + fanotify 需要)
+- 允许 `SYS_ADMIN` / `SYS_PTRACE` 能力 (进程内密钥扫描 + fanotify 需要)
 
 ### 生产部署
 
@@ -396,25 +408,28 @@ export MIMICWX_TOKEN="your-secret-token"         # 认证 Token
 WeChat 进程启动
       │
       ▼
-GDB attach (start.sh 自动触发)
+MimicWX 启动后发现 db_storage 目录
       │
       ▼
-在 setCipherKey 偏移 (0x6586C90) 设断点
+枚举 `contact.db` / `session.db` / `message_*.db`
       │
       ▼
-用户扫码登录 → 微信调用 setCipherKey 打开数据库
+读取每个数据库 page1 与 salt，构建 `DbCatalog`
       │
       ▼
-断点触发 → 从 $rsi 寄存器读取 Data 结构体
+扫描微信进程 `/proc/<pid>/maps` 与 `/proc/<pid>/mem`
       │
       ▼
-提取 32 字节 AES 密钥 → 保存至 /tmp/wechat_key.txt
+匹配 WCDB 缓存的 `enc_key` 模式 `x'<64hex><32hex>'`
       │
       ▼
-GDB detach → 微信正常运行 → MimicWX 读取密钥 → 解密数据库
+对候选 `enc_key` 执行 page1 HMAC 校验，确认数据库真实密钥
+      │
+      ▼
+写入 `KeyRegistry` → DbManager 按库打开 SQLCipher 连接
 ```
 
-> ⚠️ 密钥偏移量 `0x6586C90` 对应 WeChat Linux 4.1.0.16 版本，升级微信后可能需要更新。
+> 该方案不依赖固定偏移或断点触发时机，微信升级后通常只需保证 WCDB `enc_key` 缓存格式未发生根本变化。
 
 ---
 
@@ -433,7 +448,7 @@ GDB detach → 微信正常运行 → MimicWX 读取密钥 → 解密数据库
 | 压缩 | **zstd** | WCDB Zstd BLOB 解压 |
 | 容器化 | **Docker** (Ubuntu 22.04) | 多阶段构建 |
 | 虚拟桌面 | **Xvfb** + **openbox** | 默认 headless，可选 VNC debug |
-| 密钥提取 | **GDB** + **Python** | 运行时内存断点 |
+| 密钥解析 | **Rust** + `/proc` + HMAC | 进程内内存扫描与按库校验 |
 
 ---
 
@@ -450,7 +465,6 @@ GDB detach → 微信正常运行 → MimicWX 读取密钥 → 解密数据库
  ├── 4) 启动唯一的 AT-SPI2 bus
  ├── 5) 获取 AT-SPI2 bus 地址 → 保存环境变量
  ├── 6) 启动微信 → 等待窗口就绪
- ├── GDB 密钥提取 (后台, 等待用户扫码)
  ├── 7) noVNC websockify (仅 debug 模式)
  └── 8) MimicWX 主服务 (状态机驱动)
       ├── Booting       → AT-SPI2 连接 + X11 XTEST 输入引擎
@@ -458,7 +472,7 @@ GDB detach → 微信正常运行 → MimicWX 读取密钥 → 解密数据库
       ├── WeChatReady   → 检测登录状态
       ├── API 服务启动  → /status + /screenshot 立即可用 (登录前)
       ├── LoginWaiting  → 终端自动渲染二维码 + /screenshot 获取二维码
-      ├── KeyReady      → 读取 GDB 密钥
+      ├── KeyReady      → 扫描微信进程内存并验证关键数据库密钥
       ├── DbReady       → DbManager 初始化 + 联系人加载
       ├── Serving       → 全功能服务 + 消息监听 + 自动监听
       └── Degraded      → 部分功能降级运行
@@ -557,7 +571,8 @@ ws.send(JSON.stringify({
 ### v0.6.0
 
 - 🔄 **运行时状态机** — 显式 RuntimeState 枚举驱动启动流程，告别散落的 sleep/文件约定
-- 🧩 **Ports/Adapters 架构** — KeyProvider / MessageSource / MessageSender / SessionLocator trait 解耦基础设施和业务
+- 🔑 **进程内密钥扫描** — `keyscan.rs` 直接扫描微信进程内存并用 HMAC 校验按库确认密钥，移除 GDB 与固定偏移依赖
+- 🧩 **Ports/Adapters 架构** — MessageSource / MessageSender / SessionLocator trait 解耦基础设施和业务
 - 📡 **JSON-RPC over WebSocket** — WS 支持双向通信，适配器只需一个连接即可完成所有操作
 - 📊 **输入层可观测化** — InputMetrics 实时跟踪队列深度、命令耗时、剪贴板/焦点失败
 - 🎯 **NodeHandle 节点稳定性** — 统一的 AT-SPI 节点指纹匹配 + 缓存失效自动重定位

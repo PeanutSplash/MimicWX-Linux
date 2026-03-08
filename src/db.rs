@@ -21,19 +21,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
 
-// =====================================================================
-// FFI: sqlite3_key (WCDB 密钥传递方式)
-// =====================================================================
-
-extern "C" {
-    /// WCDB 使用 sqlite3_key() C API 传递 raw key (非 PRAGMA key).
-    /// SQLCipher 会对这个 key 做 PBKDF2 派生.
-    fn sqlite3_key(
-        db: *mut std::ffi::c_void,
-        key: *const u8,
-        key_len: std::ffi::c_int,
-    ) -> std::ffi::c_int;
-}
+use crate::keyscan::{DbCatalog, KeyRegistry};
 
 // =====================================================================
 // 类型定义
@@ -234,8 +222,10 @@ struct TableMeta {
 }
 
 pub struct DbManager {
-    /// 32 字节原始密钥
-    key_bytes: Vec<u8>,
+    /// 数据库目录快照 (启动时枚举出的数据库列表)
+    catalog: Arc<DbCatalog>,
+    /// 已验证的数据库密钥注册表 (相对路径 → raw key)
+    key_registry: Arc<KeyRegistry>,
     /// 数据库存储目录 (如 /home/wechat/.local/share/weixin/db_storage/)
     db_dir: PathBuf,
     /// 当前登录账号的 wxid (从 db_dir 路径提取, 用于判断自发消息)
@@ -264,14 +254,8 @@ pub struct DbManager {
 
 impl DbManager {
     /// 创建 DbManager
-    pub fn new(key_hex: String, db_dir: PathBuf) -> Result<Self> {
-        let key_bytes = hex_to_bytes(&key_hex).context("密钥 hex 格式错误")?;
-        anyhow::ensure!(
-            key_bytes.len() == 32,
-            "密钥长度必须为 32 字节, 实际: {}",
-            key_bytes.len()
-        );
-
+    pub fn new(catalog: Arc<DbCatalog>, key_registry: Arc<KeyRegistry>) -> Result<Self> {
+        let db_dir = catalog.db_dir().to_path_buf();
         debug!("DbManager 初始化: db_dir={}", db_dir.display());
 
         // 从 db_dir 路径提取自己的 wxid
@@ -303,23 +287,14 @@ impl DbManager {
 
         // 自动发现并连接所有 message_N.db
         let mut conns = HashMap::new();
-        let msg_dir = db_dir.join("message");
-        if msg_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&msg_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if is_message_db(&name) {
-                        let rel_path = format!("message/{}", name);
-                        match Self::open_db(&key_bytes, &db_dir, &rel_path) {
-                            Ok(conn) => {
-                                debug!("{} 持久连接已建立", name);
-                                conns.insert(rel_path, Arc::new(std::sync::Mutex::new(conn)));
-                            }
-                            Err(e) => {
-                                debug!("{} 暂不可用 (将在查询时重试): {}", name, e);
-                            }
-                        }
-                    }
+        for rel_path in catalog.message_paths() {
+            match Self::open_db(catalog.as_ref(), key_registry.as_ref(), &db_dir, rel_path) {
+                Ok(conn) => {
+                    debug!("{} 持久连接已建立", rel_path);
+                    conns.insert(rel_path.to_string(), Arc::new(std::sync::Mutex::new(conn)));
+                }
+                Err(e) => {
+                    debug!("{} 暂不可用 (将在查询时重试): {}", rel_path, e);
                 }
             }
         }
@@ -332,7 +307,8 @@ impl DbManager {
         let (wal_tx, _) = tokio::sync::broadcast::channel::<()>(64);
         let (sent_tx, _) = tokio::sync::broadcast::channel::<String>(32);
         Ok(Self {
-            key_bytes,
+            catalog,
+            key_registry,
             db_dir,
             self_wxid,
             self_display_name: tokio::sync::RwLock::new("我".to_string()),
@@ -347,14 +323,111 @@ impl DbManager {
         })
     }
 
+    /// 启动阶段验证关键数据库是否能被真实打开。
+    ///
+    /// 成功条件:
+    /// - `contact/contact.db` 可打开并通过 SQLCipher 验证
+    /// - `session/session.db` 可打开并通过 SQLCipher 验证
+    /// - 至少一个 `message_*.db` 可打开并通过 SQLCipher 验证
+    pub fn validate_required(&self) -> Result<Vec<String>> {
+        let mut validated = Vec::new();
+
+        {
+            let mut guard = self
+                .contact_conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("contact_conn lock: {}", e))?;
+            if guard.is_none() {
+                *guard = Some(Self::open_db(
+                    self.catalog.as_ref(),
+                    self.key_registry.as_ref(),
+                    &self.db_dir,
+                    "contact/contact.db",
+                )?);
+            }
+            validated.push("contact/contact.db".to_string());
+        }
+
+        {
+            let mut guard = self
+                .session_conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("session_conn lock: {}", e))?;
+            if guard.is_none() {
+                *guard = Some(Self::open_db(
+                    self.catalog.as_ref(),
+                    self.key_registry.as_ref(),
+                    &self.db_dir,
+                    "session/session.db",
+                )?);
+            }
+            validated.push("session/session.db".to_string());
+        }
+
+        let mut candidates: Vec<String> = self.catalog.message_paths().map(str::to_string).collect();
+        anyhow::ensure!(!candidates.is_empty(), "未发现 message_*.db");
+        candidates.sort();
+        if let Some(pos) = candidates.iter().position(|path| path == "message/message_0.db") {
+            let preferred = candidates.remove(pos);
+            candidates.insert(0, preferred);
+        }
+
+        let mut msg_guard = self
+            .msg_conns
+            .lock()
+            .map_err(|e| anyhow::anyhow!("msg_conns lock poisoned: {}", e))?;
+        let mut last_err = None;
+        for rel_path in candidates {
+            if !msg_guard.contains_key(&rel_path) {
+                match Self::open_db(
+                    self.catalog.as_ref(),
+                    self.key_registry.as_ref(),
+                    &self.db_dir,
+                    &rel_path,
+                ) {
+                    Ok(conn) => {
+                        msg_guard.insert(rel_path.clone(), Arc::new(std::sync::Mutex::new(conn)));
+                    }
+                    Err(err) => {
+                        debug!("关键消息库验证失败 {}: {}", rel_path, err);
+                        last_err = Some((rel_path, err));
+                        continue;
+                    }
+                }
+            }
+            validated.push(rel_path);
+            return Ok(validated);
+        }
+
+        match last_err {
+            Some((rel_path, err)) => Err(err).with_context(|| format!("关键消息库不可用: {rel_path}")),
+            None => anyhow::bail!("无可用的 message_*.db"),
+        }
+    }
+
     // =================================================================
     // 数据库连接 (同步, 在 spawn_blocking 中调用)
     // =================================================================
 
     /// 打开加密数据库 (只读模式)
-    fn open_db(key_bytes: &[u8], db_dir: &Path, db_name: &str) -> Result<Connection> {
+    fn open_db(
+        catalog: &DbCatalog,
+        key_registry: &KeyRegistry,
+        db_dir: &Path,
+        db_name: &str,
+    ) -> Result<Connection> {
         let path = db_dir.join(db_name);
         anyhow::ensure!(path.exists(), "数据库不存在: {}", path.display());
+        let enc_key = key_registry.enc_key_for(db_name)?;
+        let salt = *catalog
+            .entry(db_name)
+            .ok_or_else(|| anyhow::anyhow!("数据库目录快照中不存在: {db_name}"))?
+            .salt();
+        let pragma_key = format!(
+            "PRAGMA key = \"x'{}{}'\";",
+            hex_encode(&enc_key),
+            hex_encode(&salt)
+        );
 
         // WAL 模式下必须用 READ_WRITE 才能读到 WAL 中未 checkpoint 的新数据
         // 配合 PRAGMA query_only=ON 防止意外写入
@@ -364,17 +437,9 @@ impl DbManager {
         )
         .with_context(|| format!("打开数据库失败: {}", path.display()))?;
 
-        // 通过 FFI 调用 sqlite3_key() 传递 raw key
-        let rc = unsafe {
-            let handle = conn.handle();
-            sqlite3_key(
-                handle as *mut std::ffi::c_void,
-                key_bytes.as_ptr(),
-                key_bytes.len() as std::ffi::c_int,
-            )
-        };
-        anyhow::ensure!(rc == 0, "sqlite3_key() 失败, rc={}", rc);
-
+        // PR18 扫描命中的是 per-DB enc_key，不是旧 GDB 方案里的口令态 raw key。
+        // SQLCipher 需要按 raw-key + salt 形式接入，不能继续走 sqlite3_key(enc_key)。
+        conn.execute_batch(&pragma_key)?;
         conn.execute_batch("PRAGMA cipher_compatibility = 4;")?;
         // 安全防护: 不触发 checkpoint, 不写入数据
         conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")?;
@@ -401,22 +466,16 @@ impl DbManager {
             .map_err(|e| anyhow::anyhow!("msg_conns lock poisoned: {}", e))?;
         if guard.is_empty() {
             debug!("重新扫描 message 数据库...");
-            let msg_dir = self.db_dir.join("message");
-            if msg_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&msg_dir) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if is_message_db(&name) {
-                            let rel_path = format!("message/{}", name);
-                            if !guard.contains_key(&rel_path) {
-                                if let Ok(conn) =
-                                    Self::open_db(&self.key_bytes, &self.db_dir, &rel_path)
-                                {
-                                    debug!("{} 持久连接已建立", name);
-                                    guard.insert(rel_path, Arc::new(std::sync::Mutex::new(conn)));
-                                }
-                            }
-                        }
+            for rel_path in self.catalog.message_paths() {
+                if !guard.contains_key(rel_path) {
+                    if let Ok(conn) = Self::open_db(
+                        self.catalog.as_ref(),
+                        self.key_registry.as_ref(),
+                        &self.db_dir,
+                        rel_path,
+                    ) {
+                        debug!("{} 持久连接已建立", rel_path);
+                        guard.insert(rel_path.to_string(), Arc::new(std::sync::Mutex::new(conn)));
                     }
                 }
             }
@@ -431,7 +490,8 @@ impl DbManager {
 
     /// 加载/刷新联系人缓存 (spawn_blocking 中执行 DB 查询)
     pub async fn refresh_contacts(&self) -> Result<usize> {
-        let key = self.key_bytes.clone();
+        let catalog = Arc::clone(&self.catalog);
+        let registry = Arc::clone(&self.key_registry);
         let dir = self.db_dir.clone();
         let conn_mutex = Arc::clone(&self.contact_conn);
 
@@ -441,7 +501,12 @@ impl DbManager {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("contact_conn lock: {}", e))?;
             if guard.is_none() {
-                *guard = Some(Self::open_db(&key, &dir, "contact/contact.db")?);
+                *guard = Some(Self::open_db(
+                    catalog.as_ref(),
+                    registry.as_ref(),
+                    &dir,
+                    "contact/contact.db",
+                )?);
                 debug!("contact.db 持久连接已建立");
             }
             let conn = guard.as_ref().unwrap();
@@ -599,7 +664,8 @@ impl DbManager {
 
     /// 获取会话列表
     pub async fn get_sessions(&self) -> Result<Vec<DbSessionInfo>> {
-        let key = self.key_bytes.clone();
+        let catalog = Arc::clone(&self.catalog);
+        let registry = Arc::clone(&self.key_registry);
         let dir = self.db_dir.clone();
         let conn_mutex = Arc::clone(&self.session_conn);
 
@@ -610,7 +676,12 @@ impl DbManager {
                     .lock()
                     .map_err(|e| anyhow::anyhow!("session_conn lock: {}", e))?;
                 if guard.is_none() {
-                    *guard = Some(Self::open_db(&key, &dir, "session/session.db")?);
+                    *guard = Some(Self::open_db(
+                        catalog.as_ref(),
+                        registry.as_ref(),
+                        &dir,
+                        "session/session.db",
+                    )?);
                     debug!("session.db 持久连接已建立");
                 }
                 let conn = guard.as_ref().unwrap();
@@ -1467,24 +1538,12 @@ fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
 // 工具函数
 // =====================================================================
 
-/// 判断文件名是否为 message_N.db 格式 (N 是数字)
-/// 排除 message_fts.db, message_resource.db 等辅助数据库
-fn is_message_db(name: &str) -> bool {
-    if let Some(rest) = name.strip_prefix("message_") {
-        if let Some(num_part) = rest.strip_suffix(".db") {
-            return !num_part.is_empty() && num_part.chars().all(|c| c.is_ascii_digit());
-        }
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
     }
-    false
+    out
 }
 
-fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
-    anyhow::ensure!(hex.len() % 2 == 0, "hex 长度必须为偶数");
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .with_context(|| format!("无效 hex 字符: {}", &hex[i..i + 2]))
-        })
-        .collect()
-}

@@ -14,6 +14,7 @@ mod chatwnd;
 mod db;
 mod events;
 mod input;
+mod keyscan;
 mod node_handle;
 mod ports;
 mod runtime;
@@ -21,7 +22,6 @@ mod wechat;
 
 use anyhow::Result;
 use events::WxEvent;
-use ports::{GdbFileKeyProvider, KeyProvider};
 use runtime::{RuntimeManager, RuntimeState};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -445,69 +445,93 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ⑬ 读取 GDB 提取的数据库密钥 + 初始化 DbManager
-    let key_provider = GdbFileKeyProvider::new("/tmp/wechat_key.txt");
-    for i in 0..10 {
-        if key_provider.is_ready() {
-            if !runtime.is_degraded().await {
-                runtime.transition_to(RuntimeState::KeyReady).await;
-            }
-            break;
-        }
-        if i == 0 {
-            debug!("等待 GDB 提取密钥...");
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
+    // ⑬ 扫描微信进程内存, 构建数据库目录与按库密钥注册表
+    let db_manager: Option<Arc<db::DbManager>> = match find_db_dir() {
+        Some(dir) => {
+            debug!("开始解析数据库密钥: {}", dir.display());
+            match tokio::task::spawn_blocking(move || keyscan::resolve_catalog(dir)).await {
+                Ok(Ok(resolved)) => {
+                    debug!(
+                        "数据库密钥解析完成: {}/{} 个 DB, {} 个 hex 模式, {} 个进程",
+                        resolved.summary.resolved_keys,
+                        resolved.summary.db_files,
+                        resolved.summary.hex_patterns,
+                        resolved.summary.process_count
+                    );
+                    match db::DbManager::new(resolved.catalog, resolved.registry) {
+                        Ok(mgr) => {
+                            let mgr = Arc::new(mgr);
+                            match mgr.validate_required() {
+                                Ok(validated) => {
+                                    info!("🔓 关键数据库验证通过: {}", validated.join(", "));
+                                    if !runtime.is_degraded().await {
+                                        runtime.transition_to(RuntimeState::KeyReady).await;
+                                    }
 
-    let db_manager: Option<Arc<db::DbManager>> = match key_provider.get_key().await {
-        Ok(key) => {
-            debug!("数据库密钥已获取 ({}...{})", &key[..8], &key[56..]);
-
-            // 查找数据库目录
-            let db_dir = find_db_dir();
-            match db_dir {
-                Some(dir) => match db::DbManager::new(key, dir) {
-                    Ok(mgr) => {
-                        let mgr = Arc::new(mgr);
-                        if !runtime.is_degraded().await {
-                            runtime.transition_to(RuntimeState::DbReady).await;
+                                    // 等待微信同步数据库后再加载联系人 (刚登录时表不完整)
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    if let Err(e) = mgr.refresh_contacts().await {
+                                        warn!("⚠️ 联系人加载失败: {}", e);
+                                        if !runtime.is_degraded().await {
+                                            runtime.degrade(format!("联系人加载失败: {e}")).await;
+                                        }
+                                        None
+                                    } else {
+                                        if !runtime.is_degraded().await {
+                                            runtime.transition_to(RuntimeState::DbReady).await;
+                                        }
+                                        if let Err(e) = mgr.mark_all_read().await {
+                                            warn!("⚠️ 标记已读失败: {}", e);
+                                            if !runtime.is_degraded().await {
+                                                runtime.degrade(format!("标记已读失败: {e}")).await;
+                                            }
+                                            None
+                                        } else {
+                                            if !runtime.is_degraded().await {
+                                                runtime.transition_to(RuntimeState::Serving).await;
+                                            }
+                                            Some(mgr)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("⚠️ 关键数据库验证失败: {}", e);
+                                    if !runtime.is_degraded().await {
+                                        runtime.degrade(format!("关键数据库验证失败: {e}")).await;
+                                    }
+                                    None
+                                }
+                            }
                         }
-                        // 等待微信同步数据库后再加载联系人 (刚登录时表不完整)
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        if let Err(e) = mgr.refresh_contacts().await {
-                            warn!("⚠️ 联系人加载失败 (可能尚无数据): {}", e);
+                        Err(e) => {
+                            warn!("⚠️ DbManager 初始化失败: {}", e);
+                            if !runtime.is_degraded().await {
+                                runtime.degrade(format!("DbManager 初始化失败: {e}")).await;
+                            }
+                            None
                         }
-                        // 标记已有消息为已读
-                        if let Err(e) = mgr.mark_all_read().await {
-                            warn!("⚠️ 标记已读失败: {}", e);
-                        }
-                        if !runtime.is_degraded().await {
-                            runtime.transition_to(RuntimeState::Serving).await;
-                        }
-                        Some(mgr)
                     }
-                    Err(e) => {
-                        warn!("⚠️ DbManager 初始化失败: {}", e);
-                        if !runtime.is_degraded().await {
-                            runtime.degrade(format!("DbManager 初始化失败: {e}")).await;
-                        }
-                        None
-                    }
-                },
-                None => {
-                    warn!("⚠️ 未找到微信数据库目录, 数据库监听不可用");
+                }
+                Ok(Err(e)) => {
+                    warn!("⚠️ 数据库密钥解析失败: {}", e);
                     if !runtime.is_degraded().await {
-                        runtime.degrade("未找到微信数据库目录").await;
+                        runtime.degrade(format!("数据库密钥解析失败: {e}")).await;
+                    }
+                    None
+                }
+                Err(e) => {
+                    warn!("⚠️ 密钥扫描任务异常: {}", e);
+                    if !runtime.is_degraded().await {
+                        runtime.degrade(format!("密钥扫描任务异常: {e}")).await;
                     }
                     None
                 }
             }
         }
-        Err(e) => {
-            warn!("⚠️ 数据库密钥不可用: {}", e);
+        None => {
+            warn!("⚠️ 未找到微信数据库目录, 数据库监听不可用");
             if !runtime.is_degraded().await {
-                runtime.degrade(format!("数据库密钥不可用: {e}")).await;
+                runtime.degrade("未找到微信数据库目录").await;
             }
             None
         }

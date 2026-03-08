@@ -85,7 +85,7 @@ RUN apt-get update && apt-get install -y \
     at-spi2-core \
     xclip x11-utils \
     wget curl sudo procps net-tools gpg \
-    gdb python3 \
+    python3 \
     libcap2-bin libatomic1 \
     # 微信 Qt/xcb 运行时依赖
     libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
@@ -122,7 +122,7 @@ RUN useradd -m -s /bin/bash -G sudo wechat && \
 # 从 builder 复制编译好的二进制
 COPY --from=builder /build/target/release/mimicwx /usr/local/bin/mimicwx
 RUN chmod +x /usr/local/bin/mimicwx && \
-    setcap cap_sys_admin+ep /usr/local/bin/mimicwx
+    setcap cap_sys_admin,cap_sys_ptrace+ep /usr/local/bin/mimicwx
 
 # VNC 配置 (仅 debug build 实际使用)
 USER wechat
@@ -140,9 +140,8 @@ RUN if [ "$INSTALL_DEBUG_TOOLS" = "1" ]; then \
 USER root
 COPY docker/dbus-mimicwx.conf /etc/dbus-1/session.d/mimicwx.conf
 COPY docker/start.sh /usr/local/bin/start.sh
-COPY docker/extract_key.py /usr/local/bin/extract_key.py
-RUN sed -i 's/\r$//' /usr/local/bin/start.sh /usr/local/bin/extract_key.py && \
-    chmod +x /usr/local/bin/start.sh /usr/local/bin/extract_key.py
+RUN sed -i 's/\r$//' /usr/local/bin/start.sh && \
+    chmod +x /usr/local/bin/start.sh
 
 EXPOSE 5901 6080 8899
 CMD ["/usr/local/bin/start.sh"]

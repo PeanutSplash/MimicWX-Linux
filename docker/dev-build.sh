@@ -31,7 +31,7 @@ if cargo build 2>"$tmpfile"; then
   # 替换二进制
   sudo rm -f /usr/local/bin/mimicwx
   sudo cp target/debug/mimicwx /usr/local/bin/mimicwx
-  sudo setcap cap_sys_admin+ep /usr/local/bin/mimicwx
+  sudo setcap cap_sys_admin,cap_sys_ptrace+ep /usr/local/bin/mimicwx
 
   # 重启进程
   if sudo pkill -x mimicwx 2>/dev/null; then
