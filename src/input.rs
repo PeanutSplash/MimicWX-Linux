@@ -998,7 +998,14 @@ fn find_wechat_windows(conn: &RustConnection, root: u32) -> Vec<(u32, String, u1
         let name = get_window_name(conn, win, atoms.1, atoms.2).unwrap_or_default();
         let class = get_wm_class(conn, win, wm_class_atom).unwrap_or_default();
 
-        if !is_wechat_name(&name) && !is_wechat_name(&class) {
+        // 仅通过 WM_CLASS 判断微信窗口 (避免 xterm 标题含 "wechat@host" 误匹配)
+        if !is_wechat_class(&class) {
+            continue;
+        }
+
+        // 过滤升级弹窗 / "关于微信" 等非聊天窗口
+        if is_wechat_popup(&name) {
+            debug!("📸 跳过弹窗: '{}' 0x{:x}", name, win);
             continue;
         }
 
@@ -1045,17 +1052,33 @@ fn find_wechat_windows(conn: &RustConnection, root: u32) -> Vec<(u32, String, u1
         area_b.cmp(&area_a)
     });
 
+    // 标题为 "微信" 的窗口只保留最大的 (主窗口), 其余是弹窗/升级通知
+    let mut seen_main = false;
+    wins.retain(|(_win, name, _w, _h)| {
+        if name.trim() == "微信" {
+            if seen_main {
+                return false; // 已有更大的主窗口, 跳过此弹窗
+            }
+            seen_main = true;
+        }
+        true
+    });
+
     wins
 }
 
-fn is_wechat_name(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    // 排除终端窗口 (标题可能包含 "wechat@hostname")
-    if lower.contains("xterm") || lower.contains("bash") || lower.contains("terminal") {
-        return false;
-    }
-    // WM_CLASS 格式: "wechat wechat", 窗口标题: "微信" 或联系人名
-    lower.contains("wechat") || name.contains("微信")
+/// 通过 WM_CLASS 判断是否是微信窗口 (格式: "wechat wechat")
+fn is_wechat_class(class: &str) -> bool {
+    let lower = class.to_lowercase();
+    // WM_CLASS 的 instance 或 class 部分包含 "wechat" 即可
+    // 排除终端等其他应用 (xterm/bash 等标题可能含 "wechat@host")
+    lower.split_whitespace().any(|part| part == "wechat")
+}
+
+/// 过滤微信弹窗 (升级通知、关于对话框等)
+/// 注: 弹窗标题与主窗口相同 ("微信"), 主要通过 find_wechat_windows 末尾的去重逻辑处理
+fn is_wechat_popup(_title: &str) -> bool {
+    false
 }
 
 /// intern 截屏所需的 X11 Atom: (_NET_CLIENT_LIST, _NET_WM_NAME, UTF8_STRING)
