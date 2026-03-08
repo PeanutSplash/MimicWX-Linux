@@ -160,7 +160,7 @@ pub fn save_listen_list(config_path: &std::path::Path, listen_list: &[String]) {
     }
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     // 日志 (with_ansi(true) 强制启用 ANSI 颜色, 即使 stderr 重定向到文件)
     tracing_subscriber::fmt()
@@ -671,12 +671,18 @@ fn find_db_dir() -> Option<PathBuf> {
 
     // 收集所有可能的 xwechat_files 路径 (用 HashSet 去重)
     let mut search_dirs = std::collections::HashSet::new();
+    let home = dirs_or_home();
+    // 新版路径: ~/Documents/xwechat_files
     search_dirs.insert(PathBuf::from("/home/wechat/Documents/xwechat_files"));
-    search_dirs.insert(dirs_or_home().join("Documents/xwechat_files"));
+    search_dirs.insert(home.join("Documents/xwechat_files"));
+    // 新版路径 (部分版本直接放在 ~/ 下): ~/xwechat_files
+    search_dirs.insert(PathBuf::from("/home/wechat/xwechat_files"));
+    search_dirs.insert(home.join("xwechat_files"));
     // Fallback: 扫描 /home 下所有用户
     if let Ok(homes) = std::fs::read_dir("/home") {
         for h in homes.flatten() {
             search_dirs.insert(h.path().join("Documents/xwechat_files"));
+            search_dirs.insert(h.path().join("xwechat_files"));
         }
     }
 

@@ -72,9 +72,9 @@ su - wechat << 'USEREOF'
   export VNC_PORT="${MIMICWX_VNC_PORT}"
   export NOVNC_PORT="${MIMICWX_NOVNC_PORT}"
 
-  # 2) X11 会话: 默认 headless (Xvfb + openbox), debug 才启用 VNC/XFCE
+  # 2) X11 会话: 默认 headless (Xvfb + openbox), debug 才启用 VNC + openbox
   if [ "$MIMICWX_DEBUG" = "1" ]; then
-    echo "[start.sh] 启动 debug 桌面 (VNC + XFCE)..."
+    echo "[start.sh] 启动 debug 桌面 (VNC + openbox)..."
     vncserver -kill "$DISPLAY" 2>/dev/null || true
     rm -f "/tmp/.X${MIMICWX_DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${MIMICWX_DISPLAY_NUM}" 2>/dev/null || true
     sleep 1
@@ -105,20 +105,14 @@ su - wechat << 'USEREOF'
     cat /tmp/xvfb.log 2>/dev/null || true
   fi
 
-  # 禁用 XFCE 屏保/锁屏/电源管理 (防止息屏)
+  # 禁用屏保/DPMS (防止息屏)
   xset s off 2>/dev/null || true
   xset -dpms 2>/dev/null || true
   xset s noblank 2>/dev/null || true
-  xfconf-query -c xfce4-screensaver -p /saver/enabled -s false 2>/dev/null || true
-  xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/dpms-enabled -s false 2>/dev/null || true
-  xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/blank-on-ac -s 0 2>/dev/null || true
 
-  # 3) 清理 XFCE 自启的 AT-SPI2 (避免 bus 冲突)
-  for _r in 1 2 3; do
-    pkill -9 -f at-spi-bus-launcher 2>/dev/null || true
-    pkill -9 -f at-spi2-registryd 2>/dev/null || true
-    sleep 0.5
-  done
+  # 3) 清理可能残留的 AT-SPI2 (避免 bus 冲突)
+  pkill -9 -f at-spi-bus-launcher 2>/dev/null || true
+  pkill -9 -f at-spi2-registryd 2>/dev/null || true
   rm -f ~/.cache/at-spi/bus_1 ~/.cache/at-spi/bus 2>/dev/null || true
   sleep 1
 

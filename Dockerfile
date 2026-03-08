@@ -78,14 +78,13 @@ RUN if [ "$USE_MIRROR" = "1" ]; then \
     fi
 
 # 基础包 + headless 窗口环境 + 微信依赖
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    locales fonts-wqy-microhei fonts-wqy-zenhei fonts-noto-cjk \
+    locales fonts-wqy-microhei \
     dbus-x11 xvfb openbox xauth \
     at-spi2-core \
     xclip x11-utils \
-    wget curl sudo procps net-tools gpg \
-    python3 \
+    wget sudo procps \
     libcap2-bin libatomic1 \
     # 微信 Qt/xcb 运行时依赖
     libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
@@ -95,11 +94,12 @@ RUN apt-get update && apt-get install -y \
     libcairo2 libatspi2.0-0 libgtk-3-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Debug 工具 (VNC + 轻量终端, 用 openbox 替代 XFCE 省 ~177MB 内存)
 RUN if [ "$INSTALL_DEBUG_TOOLS" = "1" ]; then \
-    apt-get update && apt-get install -y \
-    xfce4 xfce4-terminal \
-    tigervnc-standalone-server tigervnc-common \
-    novnc websockify && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    tigervnc-standalone-server tigervnc-common tigervnc-tools \
+    novnc python3 python3-numpy websockify \
+    xterm && \
     rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -108,11 +108,16 @@ RUN locale-gen zh_CN.UTF-8 && \
     ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
     echo "Asia/Shanghai" > /etc/timezone
 
-# 安装微信 (官方 .deb)
+# 安装微信 (--force-depends: 跳过 fonts-noto-cjk 依赖, 用 fonts-wqy-microhei 替代省 ~120MB)
 RUN wget -q -O /tmp/wechat.deb \
     "https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_x86_64.deb" && \
-    dpkg -i /tmp/wechat.deb || apt-get install -f -y && \
+    dpkg -i --force-depends /tmp/wechat.deb && \
     rm -f /tmp/wechat.deb && rm -rf /var/lib/apt/lists/*
+
+# 禁用 GVFS 自动启动 (容器内无用, 省 ~7MB 内存)
+RUN for svc in /usr/share/dbus-1/services/gvfs-*; do \
+      [ -f "$svc" ] && ln -sf /dev/null "$svc"; \
+    done 2>/dev/null; true
 
 # 创建用户
 RUN useradd -m -s /bin/bash -G sudo wechat && \
@@ -132,7 +137,7 @@ RUN mkdir -p ~/.vnc
 RUN if [ "$INSTALL_DEBUG_TOOLS" = "1" ]; then \
     echo "mimicwx" | vncpasswd -f > ~/.vnc/passwd && \
     chmod 600 ~/.vnc/passwd && \
-    printf '#!/bin/bash\nunset SESSION_MANAGER\nunset DBUS_SESSION_BUS_ADDRESS\nexport XKL_XMODMAP_DISABLE=1\nexec startxfce4\n' > ~/.vnc/xstartup && \
+    printf '#!/bin/bash\nunset SESSION_MANAGER\nunset DBUS_SESSION_BUS_ADDRESS\nexport XKL_XMODMAP_DISABLE=1\nopenbox &\nexec xterm\n' > ~/.vnc/xstartup && \
     chmod +x ~/.vnc/xstartup; \
     fi
 

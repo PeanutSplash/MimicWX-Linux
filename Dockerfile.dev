@@ -21,16 +21,16 @@ RUN if [ "$USE_MIRROR" = "1" ]; then \
     fi
 
 # 运行时 + 编译依赖 (合并安装)
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    locales fonts-wqy-microhei fonts-wqy-zenhei fonts-noto-cjk \
-    xfce4 xfce4-terminal dbus-x11 \
-    tigervnc-standalone-server tigervnc-common \
-    novnc websockify \
+    locales fonts-wqy-microhei \
+    dbus-x11 openbox xvfb xauth \
+    tigervnc-standalone-server tigervnc-common tigervnc-tools \
+    novnc python3 python3-numpy websockify \
+    xterm \
     at-spi2-core \
     xclip x11-utils \
-    wget curl sudo procps net-tools gpg \
-    python3 \
+    wget curl sudo procps \
     libcap2-bin libatomic1 \
     libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
     libxcb-render-util0 libxcb-xinerama0 libxcb-shape0 libxcb-cursor0 \
@@ -41,15 +41,20 @@ RUN apt-get update && apt-get install -y \
     libdbus-1-dev libatspi2.0-dev libglib2.0-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# 禁用 GVFS 自动启动 (容器内无用)
+RUN for svc in /usr/share/dbus-1/services/gvfs-*; do \
+      [ -f "$svc" ] && ln -sf /dev/null "$svc"; \
+    done 2>/dev/null; true
+
 # 中文 locale + 时区
 RUN locale-gen zh_CN.UTF-8 && \
     ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
     echo "Asia/Shanghai" > /etc/timezone
 
-# 安装微信
+# 安装微信 (--force-depends: 跳过 fonts-noto-cjk 依赖, 用 fonts-wqy-microhei 替代省 ~120MB)
 RUN wget -q -O /tmp/wechat.deb \
     "https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_x86_64.deb" && \
-    dpkg -i /tmp/wechat.deb || apt-get install -f -y && \
+    dpkg -i --force-depends /tmp/wechat.deb && \
     rm -f /tmp/wechat.deb && rm -rf /var/lib/apt/lists/*
 
 # 创建用户
@@ -81,7 +86,7 @@ RUN mkdir -p ~/.vnc && \
     echo "mimicwx" | vncpasswd -f > ~/.vnc/passwd && \
     chmod 600 ~/.vnc/passwd
 
-RUN printf '#!/bin/bash\nunset SESSION_MANAGER\nunset DBUS_SESSION_BUS_ADDRESS\nexport XKL_XMODMAP_DISABLE=1\nexec startxfce4\n' > ~/.vnc/xstartup && \
+RUN printf '#!/bin/bash\nunset SESSION_MANAGER\nunset DBUS_SESSION_BUS_ADDRESS\nexport XKL_XMODMAP_DISABLE=1\nopenbox &\nexec xterm\n' > ~/.vnc/xstartup && \
     chmod +x ~/.vnc/xstartup
 
 # 启动脚本

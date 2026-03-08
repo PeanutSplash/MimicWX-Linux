@@ -4,13 +4,13 @@
 # API 认证 Token
 # 留空则每次启动时自动随机生成; 填写后使用固定值
 # 请求方式: Header "Authorization: Bearer <token>" 或 Query "?token=<token>"
-token = ""
+token = "123456"
 
 [listen]
 # 启动后自动弹出独立窗口并监听的对象
 # 填入联系人名称或群名称 (与微信显示名一致)
 # 示例: auto = ["NIUNIU","文件传输助手","zzz"]
-auto = ["文件传输助手"]
+auto = ["test"]
 
 [timing]
 # @ 输入流程中每步的等待时间 (毫秒)
