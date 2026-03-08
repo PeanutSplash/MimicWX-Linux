@@ -658,7 +658,14 @@ impl AtSpi {
 
     /// 导出 AT-SPI2 树（调试用，限制 200 节点）
     pub async fn dump_tree(&self, root: &NodeRef, max_depth: u32) -> Vec<TreeNode> {
-        self.dump_tree_ext(root, &DumpOptions { max_depth, ..Default::default() }).await
+        self.dump_tree_ext(
+            root,
+            &DumpOptions {
+                max_depth,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     /// 导出 AT-SPI2 树（增强版，支持 bbox/states/path 等选项）

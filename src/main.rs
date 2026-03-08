@@ -241,7 +241,11 @@ async fn main() -> Result<()> {
         config.api.token = Some(v);
     }
     if let Ok(v) = std::env::var("MIMICWX_LISTEN") {
-        config.listen.auto = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        config.listen.auto = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
     if let Ok(v) = std::env::var("MIMICWX_AT_DELAY_MS") {
         if let Ok(ms) = v.parse::<u64>() {

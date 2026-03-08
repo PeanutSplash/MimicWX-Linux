@@ -1117,15 +1117,33 @@ async fn get_node_tree(
 ) -> impl IntoResponse {
     let bus = match params.get("bus") {
         Some(b) => b.as_str(),
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing 'bus' param"}))).into_response(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing 'bus' param"})),
+            )
+                .into_response()
+        }
     };
     let node_path = match params.get("node_path") {
         Some(p) => p.as_str(),
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing 'node_path' param"}))).into_response(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing 'node_path' param"})),
+            )
+                .into_response()
+        }
     };
     let node = match AtSpi::node_from_path(bus, node_path) {
         Some(n) => n,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid path"}))).into_response(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid path"})),
+            )
+                .into_response()
+        }
     };
     let opts = parse_dump_options(&params);
     let tree = state.atspi.dump_tree_ext(&node, &opts).await;
@@ -1155,14 +1173,40 @@ async fn get_session_tree(State(state): State<Arc<AppState>>) -> impl IntoRespon
 
 /// 解析 dump_tree 的查询参数为 DumpOptions
 fn parse_dump_options(params: &HashMap<String, String>) -> crate::atspi::DumpOptions {
-    let all = params.get("all").map(|v| v == "true" || v == "1").unwrap_or(false);
+    let all = params
+        .get("all")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
     crate::atspi::DumpOptions {
-        max_depth: params.get("depth").and_then(|d| d.parse().ok()).unwrap_or(5).min(25),
-        max_nodes: params.get("max_nodes").and_then(|d| d.parse().ok()).unwrap_or(200).min(1000),
-        include_bbox: all || params.get("bbox").map(|v| v == "true" || v == "1").unwrap_or(false),
-        include_states: all || params.get("states").map(|v| v == "true" || v == "1").unwrap_or(false),
-        include_path: all || params.get("path").map(|v| v == "true" || v == "1").unwrap_or(false),
-        skip_message_list: params.get("skip_msg_list").map(|v| v != "false" && v != "0").unwrap_or(true),
+        max_depth: params
+            .get("depth")
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(5)
+            .min(25),
+        max_nodes: params
+            .get("max_nodes")
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(200)
+            .min(1000),
+        include_bbox: all
+            || params
+                .get("bbox")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+        include_states: all
+            || params
+                .get("states")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+        include_path: all
+            || params
+                .get("path")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+        skip_message_list: params
+            .get("skip_msg_list")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true),
     }
 }
 

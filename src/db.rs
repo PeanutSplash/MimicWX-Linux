@@ -319,10 +319,14 @@ impl DbManager {
             validated.push("session/session.db".to_string());
         }
 
-        let mut candidates: Vec<String> = self.catalog.message_paths().map(str::to_string).collect();
+        let mut candidates: Vec<String> =
+            self.catalog.message_paths().map(str::to_string).collect();
         anyhow::ensure!(!candidates.is_empty(), "未发现 message_*.db");
         candidates.sort();
-        if let Some(pos) = candidates.iter().position(|path| path == "message/message_0.db") {
+        if let Some(pos) = candidates
+            .iter()
+            .position(|path| path == "message/message_0.db")
+        {
             let preferred = candidates.remove(pos);
             candidates.insert(0, preferred);
         }
@@ -348,7 +352,9 @@ impl DbManager {
         }
 
         match last_err {
-            Some((rel_path, err)) => Err(err).with_context(|| format!("关键消息库不可用: {rel_path}")),
+            Some((rel_path, err)) => {
+                Err(err).with_context(|| format!("关键消息库不可用: {rel_path}"))
+            }
             None => anyhow::bail!("无可用的 message_*.db"),
         }
     }
@@ -751,7 +757,8 @@ impl DbManager {
 
         let talker_display_name = if inferred_self {
             self.self_display_name.read().await.clone()
-        } else if snapshot.username.contains("@chatroom") && !snapshot.last_sender_display_name.is_empty()
+        } else if snapshot.username.contains("@chatroom")
+            && !snapshot.last_sender_display_name.is_empty()
         {
             snapshot.last_sender_display_name.clone()
         } else {
@@ -808,7 +815,10 @@ impl DbManager {
                     msg.chat_display_name, msg.talker_display_name, msg.talker, preview
                 );
             } else {
-                info!("{icon} {}({}): {}", msg.chat_display_name, msg.talker, preview);
+                info!(
+                    "{icon} {}({}): {}",
+                    msg.chat_display_name, msg.talker, preview
+                );
             }
         }
 
@@ -1146,4 +1156,3 @@ fn hex_encode(bytes: &[u8]) -> String {
     }
     out
 }
-

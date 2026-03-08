@@ -97,7 +97,12 @@ impl DbCatalog {
     pub fn required_paths(&self) -> Vec<&str> {
         self.entries
             .iter()
-            .filter(|entry| matches!(entry.role, DbRole::Contact | DbRole::Session | DbRole::Message))
+            .filter(|entry| {
+                matches!(
+                    entry.role,
+                    DbRole::Contact | DbRole::Session | DbRole::Message
+                )
+            })
             .map(|entry| entry.rel_path.as_str())
             .collect()
     }
@@ -151,7 +156,6 @@ impl KeyRegistry {
             .map(VerifiedKey::enc_key)
             .ok_or_else(|| anyhow!("未找到数据库密钥: {rel_path}"))
     }
-
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -259,7 +263,10 @@ impl MemoryKeyResolver {
     fn new(catalog: Arc<DbCatalog>) -> Self {
         let mut salt_to_indices = HashMap::new();
         for (idx, entry) in catalog.entries().iter().enumerate() {
-            salt_to_indices.entry(*entry.salt()).or_insert_with(Vec::new).push(idx);
+            salt_to_indices
+                .entry(*entry.salt())
+                .or_insert_with(Vec::new)
+                .push(idx);
         }
         Self {
             catalog,
@@ -425,8 +432,11 @@ impl MemoryKeyResolver {
         if self.unique_keys.is_empty() {
             return;
         }
-        let known_keys: Vec<([u8; KEY_SZ], (i32, usize))> =
-            self.unique_keys.iter().map(|(key, meta)| (*key, *meta)).collect();
+        let known_keys: Vec<([u8; KEY_SZ], (i32, usize))> = self
+            .unique_keys
+            .iter()
+            .map(|(key, meta)| (*key, *meta))
+            .collect();
         let indices: Vec<usize> = self.unresolved_indices().collect();
         for idx in indices {
             let entry = &self.catalog.entries()[idx];
@@ -460,8 +470,8 @@ fn collect_db_entries(root: &Path, current: &Path, entries: &mut Vec<DbFingerpri
             continue;
         }
 
-        let mut file = File::open(&path)
-            .with_context(|| format!("读取数据库首页失败: {}", path.display()))?;
+        let mut file =
+            File::open(&path).with_context(|| format!("读取数据库首页失败: {}", path.display()))?;
         let mut page1 = [0u8; PAGE_SZ];
         file.read_exact(&mut page1)
             .with_context(|| format!("读取数据库 page1 失败: {}", path.display()))?;
@@ -494,8 +504,8 @@ fn load_cached_registry(catalog: &DbCatalog) -> Result<Option<KeyRegistry>> {
         return Ok(None);
     }
 
-    let data = std::fs::read(&path)
-        .with_context(|| format!("读取密钥缓存失败: {}", path.display()))?;
+    let data =
+        std::fs::read(&path).with_context(|| format!("读取密钥缓存失败: {}", path.display()))?;
     let cache: KeyCacheFile = serde_json::from_slice(&data)
         .with_context(|| format!("解析密钥缓存失败: {}", path.display()))?;
     if cache.version != 1 {
@@ -557,8 +567,11 @@ fn persist_registry_cache(catalog: &DbCatalog, registry: &KeyRegistry) -> Result
         });
     }
 
-    let payload = serde_json::to_vec_pretty(&KeyCacheFile { version: 1, entries })
-        .context("序列化密钥缓存失败")?;
+    let payload = serde_json::to_vec_pretty(&KeyCacheFile {
+        version: 1,
+        entries,
+    })
+    .context("序列化密钥缓存失败")?;
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, payload)
         .with_context(|| format!("写入密钥缓存临时文件失败: {}", tmp_path.display()))?;
@@ -601,7 +614,10 @@ fn find_wechat_processes() -> Result<Vec<(i32, u64)>> {
         let Ok(pid) = pid_str.parse::<i32>() else {
             continue;
         };
-        if let Some(rss_kb) = is_wechat_process(pid).then(|| read_rss_kb(pid).ok()).flatten() {
+        if let Some(rss_kb) = is_wechat_process(pid)
+            .then(|| read_rss_kb(pid).ok())
+            .flatten()
+        {
             processes.push((pid, rss_kb));
         }
     }
