@@ -1042,6 +1042,11 @@ fn find_wechat_windows(conn: &RustConnection, root: u32) -> Vec<(u32, String, u1
 
 fn is_wechat_name(name: &str) -> bool {
     let lower = name.to_lowercase();
+    // 排除终端窗口 (标题可能包含 "wechat@hostname")
+    if lower.contains("xterm") || lower.contains("bash") || lower.contains("terminal") {
+        return false;
+    }
+    // WM_CLASS 格式: "wechat wechat", 窗口标题: "微信" 或联系人名
     lower.contains("wechat") || name.contains("微信")
 }
 
