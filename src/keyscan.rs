@@ -13,6 +13,7 @@ const PAGE_SZ: usize = 4096;
 const KEY_SZ: usize = 32;
 const SALT_SZ: usize = 16;
 const MAX_REGION_SIZE: usize = 500 * 1024 * 1024;
+const KEY_CACHE_FILE: &str = ".mimicwx-keycache.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbRole {
@@ -153,6 +154,18 @@ impl KeyRegistry {
 
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct KeyCacheFile {
+    version: u32,
+    entries: Vec<KeyCacheEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct KeyCacheEntry {
+    rel_path: String,
+    enc_key_hex: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScanSummary {
     pub process_count: usize,
@@ -176,6 +189,19 @@ pub fn resolve_catalog(db_dir: PathBuf) -> Result<ResolvedCatalog> {
         catalog.db_dir().display(),
         db_count
     );
+
+    if let Some(registry) = load_cached_registry(&catalog)? {
+        info!("🔐 已复用缓存数据库密钥: {} 个", registry.count());
+        return Ok(ResolvedCatalog {
+            catalog,
+            registry: Arc::new(registry),
+            summary: ScanSummary {
+                resolved_keys: db_count,
+                db_files: db_count,
+                ..ScanSummary::default()
+            },
+        });
+    }
 
     let mut resolver = MemoryKeyResolver::new(Arc::clone(&catalog));
     let summary = resolver.scan()?;
@@ -204,6 +230,10 @@ pub fn resolve_catalog(db_dir: PathBuf) -> Result<ResolvedCatalog> {
             unresolved.len(),
             unresolved.join(", ")
         );
+    }
+
+    if let Err(err) = persist_registry_cache(&catalog, registry.as_ref()) {
+        warn!("⚠️ 写入密钥缓存失败: {}", err);
     }
 
     Ok(ResolvedCatalog {
@@ -454,6 +484,89 @@ fn collect_db_entries(root: &Path, current: &Path, entries: &mut Vec<DbFingerpri
     Ok(())
 }
 
+fn cache_path(catalog: &DbCatalog) -> PathBuf {
+    catalog.db_dir().join(KEY_CACHE_FILE)
+}
+
+fn load_cached_registry(catalog: &DbCatalog) -> Result<Option<KeyRegistry>> {
+    let path = cache_path(catalog);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let data = std::fs::read(&path)
+        .with_context(|| format!("读取密钥缓存失败: {}", path.display()))?;
+    let cache: KeyCacheFile = serde_json::from_slice(&data)
+        .with_context(|| format!("解析密钥缓存失败: {}", path.display()))?;
+    if cache.version != 1 {
+        warn!("⚠️ 密钥缓存版本不兼容, 将重建: {}", path.display());
+        return Ok(None);
+    }
+
+    let mut keys = HashMap::new();
+    for entry in cache.entries {
+        let Some(db) = catalog.entry(&entry.rel_path) else {
+            continue;
+        };
+        let Some(enc_key) = decode_fixed_hex::<KEY_SZ>(&entry.enc_key_hex) else {
+            warn!("⚠️ 密钥缓存格式损坏, 将重建: {}", entry.rel_path);
+            return Ok(None);
+        };
+        if !verify_enc_key(&enc_key, db.page1()) {
+            info!("🔄 密钥缓存失效, 将重新扫描: {}", entry.rel_path);
+            return Ok(None);
+        }
+        keys.insert(
+            entry.rel_path.clone(),
+            VerifiedKey {
+                rel_path: entry.rel_path,
+                enc_key,
+                pid: 0,
+                addr: 0,
+            },
+        );
+    }
+
+    let registry = KeyRegistry::new(keys);
+    let missing_required: Vec<&str> = catalog
+        .required_paths()
+        .into_iter()
+        .filter(|rel_path| !registry.contains(rel_path))
+        .collect();
+    if !missing_required.is_empty() {
+        info!(
+            "🔄 密钥缓存不完整, 将重新扫描: {}",
+            missing_required.join(", ")
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(registry))
+}
+
+fn persist_registry_cache(catalog: &DbCatalog, registry: &KeyRegistry) -> Result<()> {
+    let path = cache_path(catalog);
+    let mut entries = Vec::new();
+    for db in catalog.entries() {
+        let Some(enc_key) = registry.keys.get(db.rel_path()).map(VerifiedKey::enc_key) else {
+            continue;
+        };
+        entries.push(KeyCacheEntry {
+            rel_path: db.rel_path().to_string(),
+            enc_key_hex: hex_encode(&enc_key),
+        });
+    }
+
+    let payload = serde_json::to_vec_pretty(&KeyCacheFile { version: 1, entries })
+        .context("序列化密钥缓存失败")?;
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, payload)
+        .with_context(|| format!("写入密钥缓存临时文件失败: {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path)
+        .with_context(|| format!("替换密钥缓存失败: {}", path.display()))?;
+    Ok(())
+}
+
 fn classify_role(rel_path: &str) -> DbRole {
     match rel_path {
         "contact/contact.db" => DbRole::Contact,
@@ -583,6 +696,26 @@ fn decode_salt(hex: &[u8]) -> Option<[u8; SALT_SZ]> {
         out[index] = decode_hex_byte(chunk)?;
     }
     Some(out)
+}
+
+fn decode_fixed_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    if hex.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        out[index] = decode_hex_byte(chunk)?;
+    }
+    Some(out)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 fn decode_hex_byte(hex: &[u8]) -> Option<u8> {
