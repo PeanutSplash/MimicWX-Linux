@@ -11,6 +11,7 @@ output.log
 *.swo
 
 # Local config
+config.toml
 Makefile.local
 
 # OS

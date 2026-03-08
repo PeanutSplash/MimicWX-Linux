@@ -74,7 +74,29 @@ fn default_at_delay() -> u64 {
     300
 }
 
-/// 加载配置文件 (搜索多个路径)
+/// 默认配置文件模板
+const DEFAULT_CONFIG_TEMPLATE: &str = r#"# MimicWX-Linux 配置文件
+
+[api]
+# API 认证 Token
+# 留空则每次启动时自动随机生成并回写到此文件; 填写后使用固定值
+# 请求方式: Header "Authorization: Bearer <token>" 或 Query "?token=<token>"
+token = ""
+
+[listen]
+# 启动后自动弹出独立窗口并监听的对象
+# 填入联系人名称或群名称 (与微信显示名一致)
+# 示例: auto = ["NIUNIU","文件传输助手","zzz"]
+auto = []
+
+[timing]
+# @ 输入流程中每步的等待时间 (毫秒)
+# 降低可加快速度, 但太低可能导致微信选择器来不及响应
+# 默认 300, 建议范围 150~500
+at_delay_ms = 300
+"#;
+
+/// 加载配置文件 (搜索多个路径, 不存在则自动创建)
 /// 返回 (配置, 配置文件路径)
 fn load_config() -> (AppConfig, Option<PathBuf>) {
     let search_paths = [
@@ -100,8 +122,44 @@ fn load_config() -> (AppConfig, Option<PathBuf>) {
             }
         }
     }
-    info!("⚙️ 未找到配置文件, 使用默认配置");
-    (AppConfig::default(), None)
+    // 自动创建默认配置文件
+    let create_path = &search_paths[0];
+    match std::fs::write(create_path, DEFAULT_CONFIG_TEMPLATE) {
+        Ok(_) => info!("⚙️ 已自动创建配置文件: {}", create_path.display()),
+        Err(e) => warn!("⚠️ 无法创建配置文件: {} - {}", create_path.display(), e),
+    }
+    (AppConfig::default(), Some(create_path.clone()))
+}
+
+/// 将自动生成的 token 回写到 config.toml
+pub fn save_token(config_path: &std::path::Path, token: &str) {
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("⚠️ 无法读取配置文件: {e}");
+            return;
+        }
+    };
+    let mut new_lines: Vec<String> = Vec::new();
+    let mut found = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('#') && trimmed.starts_with("token") && trimmed.contains('=') {
+            new_lines.push(format!("token = \"{}\"", token));
+            found = true;
+        } else {
+            new_lines.push(line.to_string());
+        }
+    }
+    let new_content = if found {
+        new_lines.join("\n")
+    } else {
+        content.replace("[api]", &format!("[api]\ntoken = \"{}\"", token))
+    };
+    match std::fs::write(config_path, new_content) {
+        Ok(_) => info!("⚙️ Token 已保存到 {}", config_path.display()),
+        Err(e) => warn!("⚠️ 保存 Token 失败: {e}"),
+    }
 }
 
 /// 保存监听列表到 config.toml (仅替换 auto = [...] 行, 保留注释和格式)
@@ -175,8 +233,22 @@ async fn main() -> Result<()> {
 
     let runtime = Arc::new(RuntimeManager::new(RuntimeState::Booting));
 
-    // ① 加载配置文件
-    let (config, config_path) = load_config();
+    // ① 加载配置文件, 环境变量覆盖
+    let (mut config, config_path) = load_config();
+
+    // 环境变量覆盖: MIMICWX_TOKEN, MIMICWX_LISTEN, MIMICWX_AT_DELAY_MS
+    if let Ok(v) = std::env::var("MIMICWX_TOKEN") {
+        config.api.token = Some(v);
+    }
+    if let Ok(v) = std::env::var("MIMICWX_LISTEN") {
+        config.listen.auto = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    }
+    if let Ok(v) = std::env::var("MIMICWX_AT_DELAY_MS") {
+        if let Ok(ms) = v.parse::<u64>() {
+            config.timing.at_delay_ms = ms;
+        }
+    }
+
     if !config.listen.auto.is_empty() {
         debug!("📋 自动监听列表: {:?}", config.listen.auto);
     }
@@ -260,6 +332,10 @@ async fn main() -> Result<()> {
                 );
                 let token = format!("{:x}", md5::compute(&seed));
                 warn!("🔑 未配置 Token, 已自动生成: {token}");
+                // 回写到配置文件
+                if let Some(ref path) = config_path {
+                    save_token(path, &token);
+                }
                 Some(token)
             }
         },
