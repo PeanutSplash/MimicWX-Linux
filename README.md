@@ -8,7 +8,7 @@
 
 ## ✨ 特性
 
-- 🔍 **数据库消息检测** — SQLCipher 解密 WCDB + fanotify WAL 实时监听，亚秒级延迟，支持文本/图片/语音/视频/链接等 13+ 种消息类型解析
+- 🔍 **数据库消息检测** — SQLCipher 解密 WCDB + `session.db` 驱动的新消息检测，结合 `mtime` 轮询实现稳定低延迟推送，支持文本/图片/语音/视频/链接等 13+ 种消息类型解析
 - ⌨️ **X11 原生输入注入** — XTEST 扩展注入键鼠事件 + X11 Selection 协议直接操作剪贴板（零外部进程依赖），原生窗口管理
 - 🔑 **进程内密钥扫描** — 直接扫描微信进程内存中的 WCDB `enc_key` 候选，并用 page1 HMAC 校验按库确认密钥，无需 GDB 和固定偏移
 - 💬 **独立聊天窗口** — 借鉴 [wxauto](https://github.com/cluic/wxauto) 的 ChatWnd 设计，支持多窗口并行收发 + NodeHandle 缓存自动失效重建
@@ -44,7 +44,7 @@
 │  │                                                                       │ │
 │  │  ┌── 消息检测层 ────────────────────────────────────────────────┐     │ │
 │  │  │  keyscan.rs: /proc 内存扫描 → HMAC 校验 → 按库密钥注册表     │     │ │
-│  │  │  db.rs:      SQLCipher 解密 → fanotify WAL 监听 → 增量消息拉取│     │ │
+│  │  │  db.rs:      SQLCipher 解密 → SessionTable 变化检测 → 增量消息 │     │ │
 │  │  │  atspi.rs:   D-Bus → AT-SPI2 Registry → 节点遍历/属性读取     │     │ │
 │  │  └──────────────────────────────────────────────────────────────┘     │ │
 │  │                                                                       │ │
@@ -92,7 +92,7 @@ MimicWX-Linux/
 │   ├── wechat.rs               # 微信业务逻辑 (会话管理、消息发送/验证)
 │   ├── chatwnd.rs              # 独立聊天窗口 (ChatWnd 模式)
 │   ├── keyscan.rs              # 微信进程内存扫描 + 按库密钥注册表
-│   ├── db.rs                   # 数据库监听 (SQLCipher + fanotify WAL)
+│   ├── db.rs                   # 数据库监听 (SQLCipher + session mtime 轮询)
 │   └── api.rs                  # HTTP/WebSocket API (axum + JSON-RPC 2.0)
 ├── docker/
 │   ├── start.sh                # 容器启动脚本 (headless/debug 双模式)
@@ -132,7 +132,7 @@ MimicWX-Linux/
 
 | Port (trait) | Adapter (实现) | 职责 |
 |-------------|---------------|------|
-| `MessageSource` | `WcdbMessageSource` (db.rs) | 数据库增量消息 + fanotify 监听 |
+| `MessageSource` | `WcdbMessageSource` (db.rs) | `session.db` 增量检测 + `mtime` 轮询 |
 | `MessageSender` | `ActorPort` | AT-SPI + X11 发送消息/图片 |
 | `SessionLocator` | `ActorPort` | 会话切换 / 监听管理 |
 
@@ -200,14 +200,15 @@ MimicWX-Linux/
 
 ### `db.rs` — 数据库监听
 
-SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
+SQLCipher 解密微信 WCDB 数据库 + `mtime` 实时轮询：
 
 | 能力 | 说明 |
 |------|------|
 | **SQLCipher 解密** | `rusqlite` + `bundled-sqlcipher-vendored-openssl`，按数据库从 `KeyRegistry` 取已验证 `enc_key`，结合 page1 salt 以 raw-key 形式开库 |
 | **持久连接池** | 多个 `message_N.db` 保持长连接，避免重复解密握手 |
-| **WAL 监听** | `fanotify` + PID 过滤 (只监听微信进程写入)，无需防抖 |
-| **增量消息** | 每个消息表维护 `last_local_id` 高水位标记 |
+| **Session 驱动** | 以 `session.db` 的 `SessionTable` 变化作为新消息触发源 |
+| **变化检测** | 30ms 轮询 `session.db` / `session.db-wal` 的 `mtime` |
+| **增量消息** | 比较 `last_timestamp` / `last_msg_type` / `summary` 生成新消息事件 |
 | **联系人缓存** | 从 `contact.db` + `group_contact.db` 加载联系人/群成员 |
 | **消息解析** | 支持文本/图片/语音/视频/表情/名片/链接/小程序/文件/转账/红包/系统消息 |
 | **WCDB 兼容** | Zstd BLOB 解压 + TEXT/BLOB 自适应读取 |
@@ -439,7 +440,7 @@ MimicWX 启动后发现 db_storage 目录
 |------|------|------|
 | 语言 | **Rust** | 异步高性能，零运行时开销 |
 | 异步运行时 | **Tokio** | 全功能异步运行时 |
-| 消息检测 | **SQLCipher** + **fanotify** | 数据库解密 + WAL 实时监听 |
+| 消息检测 | **SQLCipher** + **mtime polling** | 数据库解密 + `session.db` 实时轮询 |
 | UI 自动化 | **AT-SPI2** (`atspi-rs` + `zbus`) | D-Bus 无障碍接口控制 |
 | 输入注入 | **X11 XTEST** (`x11rb`) | 原生 X11 扩展 + Selection 剪贴板 |
 | API 服务 | **axum** | HTTP + WebSocket (JSON-RPC 2.0) |

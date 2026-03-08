@@ -480,10 +480,12 @@ async fn main() -> Result<()> {
                                         if !runtime.is_degraded().await {
                                             runtime.transition_to(RuntimeState::DbReady).await;
                                         }
-                                        if let Err(e) = mgr.mark_all_read().await {
-                                            warn!("⚠️ 标记已读失败: {}", e);
+                                        if let Err(e) = mgr.prime_session_state().await {
+                                            warn!("⚠️ Session 基线初始化失败: {}", e);
                                             if !runtime.is_degraded().await {
-                                                runtime.degrade(format!("标记已读失败: {e}")).await;
+                                                runtime
+                                                    .degrade(format!("Session 基线初始化失败: {e}"))
+                                                    .await;
                                             }
                                             None
                                         } else {
@@ -562,27 +564,22 @@ async fn main() -> Result<()> {
             });
         }
 
-        // 启动 WAL fanotify 监听 (PID 过滤, 无需防抖)
+        // 启动 session.db 变化监听 (mtime 轮询)
         let mut wal_rx = db.spawn_wal_watcher();
 
         tokio::spawn(async move {
-            info!("👂 数据库消息监听启动 (fanotify PID 过滤)");
+            info!("👂 Session 消息监听启动 (SessionTable 驱动)");
 
             loop {
-                // 等待 WAL 变化通知 (fanotify 已过滤自身事件, 无需防抖)
-                match tokio::time::timeout(std::time::Duration::from_secs(30), wal_rx.recv()).await
-                {
-                    Ok(Ok(())) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                        error!("❌ WAL 监听通道关闭");
+                match wal_rx.recv().await {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        error!("❌ Session 监听通道关闭");
                         break;
-                    }
-                    Err(_) => {
-                        // 30s 超时也执行一次轮询 (fallback)
                     }
                 }
 
-                // 拉取新消息
+                // 基于 SessionTable 拉取新消息
                 match db.get_new_messages().await {
                     Ok(msgs) => {
                         for m in &msgs {

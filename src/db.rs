@@ -192,33 +192,15 @@ pub struct DbMessage {
     pub at_user_list: Vec<String>,
 }
 
-/// 原始消息 (同步查询返回, 后续异步填充显示名)
-struct RawMsg {
-    local_id: i64,
-    server_id: i64,
-    create_time: i64,
-    content: String,
-    msg_type: i64,
-    talker: String,
-    chat: String,
-    status: i64,
-    /// 消息元数据 XML (含 atuserlist 等)
-    source: String,
-}
-
-// =====================================================================
-// DbManager — 核心结构
-// =====================================================================
-
-/// 消息表结构元数据缓存 (避免每次查询重新执行 PRAGMA table_info)
 #[derive(Debug, Clone)]
-struct TableMeta {
-    /// 表名
-    table: String,
-    /// 预编译的 SELECT SQL
-    select_sql: String,
-    /// ID 列名 (local_id / rowid)
-    id_col: String,
+struct SessionSnapshot {
+    username: String,
+    unread_count: i32,
+    summary: String,
+    last_timestamp: i64,
+    last_msg_type: i64,
+    last_msg_sender: String,
+    last_sender_display_name: String,
 }
 
 pub struct DbManager {
@@ -234,18 +216,12 @@ pub struct DbManager {
     self_display_name: tokio::sync::RwLock<String>,
     /// 联系人缓存: username → ContactInfo
     contacts: Mutex<HashMap<String, ContactInfo>>,
-    /// 高水位线: "db_name::表名" → 最大 local_id (多数据库区分)
-    watermarks: Mutex<HashMap<String, i64>>,
-    /// 持久化 message_N.db 连接池 (避免每次查询重做 PBKDF2 ~500ms)
-    /// key = 相对路径 (如 "message/message_0.db")
-    msg_conns: std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<Connection>>>>,
+    /// SessionTable 快照: username → 最新摘要/时间戳
+    session_state: Mutex<HashMap<String, SessionSnapshot>>,
     /// 持久化 contact.db 连接 (避免每次重做 PBKDF2)
     contact_conn: Arc<std::sync::Mutex<Option<Connection>>>,
     /// 持久化 session.db 连接
     session_conn: Arc<std::sync::Mutex<Option<Connection>>>,
-    /// 消息表结构元数据缓存: "db_name::table_name" → TableMeta
-    /// 表的列结构在运行期间不变, 但微信可能动态创建新表
-    table_meta_cache: std::sync::Mutex<HashMap<String, TableMeta>>,
     /// WAL 变化广播通知 (多消费者: 消息循环 + verify_sent 等)
     wal_notify: tokio::sync::broadcast::Sender<()>,
     /// 自发消息内容广播 (get_new_messages 检测到自发消息时发出)
@@ -285,25 +261,6 @@ impl DbManager {
             debug!("当前账号: {}", self_wxid);
         }
 
-        // 自动发现并连接所有 message_N.db
-        let mut conns = HashMap::new();
-        for rel_path in catalog.message_paths() {
-            match Self::open_db(catalog.as_ref(), key_registry.as_ref(), &db_dir, rel_path) {
-                Ok(conn) => {
-                    debug!("{} 持久连接已建立", rel_path);
-                    conns.insert(rel_path.to_string(), Arc::new(std::sync::Mutex::new(conn)));
-                }
-                Err(e) => {
-                    debug!("{} 暂不可用 (将在查询时重试): {}", rel_path, e);
-                }
-            }
-        }
-        if conns.is_empty() {
-            warn!("⚠️ 未发现可用的 message 数据库 (将在首次查询时重试)");
-        } else {
-            debug!("已连接 {} 个消息数据库", conns.len());
-        }
-
         let (wal_tx, _) = tokio::sync::broadcast::channel::<()>(64);
         let (sent_tx, _) = tokio::sync::broadcast::channel::<String>(32);
         Ok(Self {
@@ -313,11 +270,9 @@ impl DbManager {
             self_wxid,
             self_display_name: tokio::sync::RwLock::new("我".to_string()),
             contacts: Mutex::new(HashMap::new()),
-            watermarks: Mutex::new(HashMap::new()),
-            msg_conns: std::sync::Mutex::new(conns),
+            session_state: Mutex::new(HashMap::new()),
             contact_conn: Arc::new(std::sync::Mutex::new(None)),
             session_conn: Arc::new(std::sync::Mutex::new(None)),
-            table_meta_cache: std::sync::Mutex::new(HashMap::new()),
             wal_notify: wal_tx,
             sent_content_tx: sent_tx,
         })
@@ -372,31 +327,24 @@ impl DbManager {
             candidates.insert(0, preferred);
         }
 
-        let mut msg_guard = self
-            .msg_conns
-            .lock()
-            .map_err(|e| anyhow::anyhow!("msg_conns lock poisoned: {}", e))?;
         let mut last_err = None;
         for rel_path in candidates {
-            if !msg_guard.contains_key(&rel_path) {
-                match Self::open_db(
-                    self.catalog.as_ref(),
-                    self.key_registry.as_ref(),
-                    &self.db_dir,
-                    &rel_path,
-                ) {
-                    Ok(conn) => {
-                        msg_guard.insert(rel_path.clone(), Arc::new(std::sync::Mutex::new(conn)));
-                    }
-                    Err(err) => {
-                        debug!("关键消息库验证失败 {}: {}", rel_path, err);
-                        last_err = Some((rel_path, err));
-                        continue;
-                    }
+            match Self::open_db(
+                self.catalog.as_ref(),
+                self.key_registry.as_ref(),
+                &self.db_dir,
+                &rel_path,
+            ) {
+                Ok(_) => {
+                    validated.push(rel_path);
+                    return Ok(validated);
+                }
+                Err(err) => {
+                    debug!("关键消息库验证失败 {}: {}", rel_path, err);
+                    last_err = Some((rel_path, err));
+                    continue;
                 }
             }
-            validated.push(rel_path);
-            return Ok(validated);
         }
 
         match last_err {
@@ -454,34 +402,6 @@ impl DbManager {
 
         trace!("🔓 {} 解密成功, {} 个表", db_name, count);
         Ok(conn)
-    }
-
-    /// 确保至少有一个 message 数据库连接可用 (如为空则重新扫描)
-    fn ensure_msg_conns(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, HashMap<String, Arc<std::sync::Mutex<Connection>>>>> {
-        let mut guard = self
-            .msg_conns
-            .lock()
-            .map_err(|e| anyhow::anyhow!("msg_conns lock poisoned: {}", e))?;
-        if guard.is_empty() {
-            debug!("重新扫描 message 数据库...");
-            for rel_path in self.catalog.message_paths() {
-                if !guard.contains_key(rel_path) {
-                    if let Ok(conn) = Self::open_db(
-                        self.catalog.as_ref(),
-                        self.key_registry.as_ref(),
-                        &self.db_dir,
-                        rel_path,
-                    ) {
-                        debug!("{} 持久连接已建立", rel_path);
-                        guard.insert(rel_path.to_string(), Arc::new(std::sync::Mutex::new(conn)));
-                    }
-                }
-            }
-            anyhow::ensure!(!guard.is_empty(), "无可用的 message 数据库");
-        }
-        Ok(guard)
     }
 
     // =================================================================
@@ -726,304 +646,173 @@ impl DbManager {
     // 增量消息
     // =================================================================
 
-    /// 获取新消息 (遍历所有 message_N.db 持久连接)
-    pub async fn get_new_messages(&self) -> Result<Vec<DbMessage>> {
-        let current_watermarks = self.watermarks.lock().await.clone();
+    async fn load_session_snapshots(&self) -> Result<Vec<SessionSnapshot>> {
+        let catalog = Arc::clone(&self.catalog);
+        let registry = Arc::clone(&self.key_registry);
+        let dir = self.db_dir.clone();
+        let conn_mutex = Arc::clone(&self.session_conn);
 
-        // 克隆 Arc 引用传入 spawn_blocking (安全, 无 unsafe)
-        let conn_arcs: Vec<(String, Arc<std::sync::Mutex<Connection>>)> = {
-            let conns_guard = self.ensure_msg_conns()?;
-            conns_guard
-                .iter()
-                .map(|(name, conn)| (name.clone(), Arc::clone(conn)))
-                .collect()
-        };
-
-        // 获取表结构缓存: key = "db_name::table_name" → TableMeta
-        // 每次都查表列表 (1 条 SQL, 很快), 但只对新出现的表执行 PRAGMA
-        let cached_meta: HashMap<String, TableMeta> = {
-            self.table_meta_cache
+        tokio::task::spawn_blocking(move || -> Result<Vec<SessionSnapshot>> {
+            let mut guard = conn_mutex
                 .lock()
-                .map(|g| g.clone())
-                .unwrap_or_default()
-        };
-        // 复用持久化的 Name2Id MD5 缓存 (避免每次从 DB 重建)
-        let (raw_msgs, new_watermarks, updated_meta) = tokio::task::spawn_blocking(move || -> Result<(Vec<RawMsg>, HashMap<String, i64>, HashMap<String, TableMeta>)> {
-            let mut all_msgs = Vec::new();
-            let mut wm = current_watermarks;
-            let mut name2id_cache: HashMap<String, String> = HashMap::new();
-            let mut meta_cache = cached_meta;
-
-            for (db_name, conn_arc) in &conn_arcs {
-                let conn = conn_arc.lock().map_err(|e| anyhow::anyhow!("conn lock: {}", e))?;
-                let db_prefix = db_name.trim_start_matches("message/").trim_end_matches(".db");
-
-                // 每次都查表列表 (微信可能动态创建新表)
-                let tables = discover_msg_tables(&conn);
-                if tables.is_empty() { continue; }
-
-                // 对每个表: 查缓存 → 有则复用, 无则 PRAGMA 构建
-                let mut table_metas = Vec::new();
-                for table in &tables {
-                    let cache_key = format!("{}::{}", db_name, table);
-                    if let Some(cached) = meta_cache.get(&cache_key) {
-                        table_metas.push(cached.clone());
-                    } else {
-                        // 新表: PRAGMA 获取列结构
-                        if let Some(meta) = build_single_table_meta(&conn, table) {
-                            debug!("{} 新增表结构缓存: {}", db_name, table);
-                            meta_cache.insert(cache_key, meta.clone());
-                            table_metas.push(meta);
-                        }
+                .map_err(|e| anyhow::anyhow!("session_conn lock: {}", e))?;
+            if guard.is_none() {
+                *guard = Some(Self::open_db(
+                    catalog.as_ref(),
+                    registry.as_ref(),
+                    &dir,
+                    "session/session.db",
+                )?);
+                debug!("session.db 持久连接已建立");
+            }
+            let conn = guard.as_ref().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT username, unread_count, summary, last_timestamp, \
+                        last_msg_type, last_msg_sender, last_sender_display_name \
+                 FROM SessionTable \
+                 WHERE last_timestamp > 0",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(SessionSnapshot {
+                        username: wcdb_get_text(row, 0),
+                        unread_count: row.get::<_, Option<i32>>(1)?.unwrap_or(0),
+                        summary: wcdb_get_text(row, 2),
+                        last_timestamp: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        last_msg_type: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        last_msg_sender: wcdb_get_text(row, 5),
+                        last_sender_display_name: wcdb_get_text(row, 6),
+                    })
+                })?
+                .filter_map(|row| match row {
+                    Ok(snapshot) if !snapshot.username.is_empty() => Some(snapshot),
+                    Ok(_) => None,
+                    Err(err) => {
+                        warn!("⚠️ SessionTable 行读取失败: {}", err);
+                        None
                     }
-                }
-
-                for meta in &table_metas {
-                    let wm_key = format!("{}::{}", db_prefix, meta.table);
-                    let last_id = wm.get(&wm_key).copied().unwrap_or(0);
-
-                    let mut stmt = match conn.prepare(&meta.select_sql) {
-                        Ok(s) => s,
-                        Err(e) => { warn!("⚠️ 查询 {} ({}) 失败: {}", meta.table, db_name, e); continue; }
-                    };
-                    let msgs: Vec<(i64, i64, i64, String, i64, String, i64, String)> = match stmt
-                        .query_map([last_id], |row| {
-                            let local_id: i64 = row.get(0)?;
-                            let svr_id: i64 = row.get::<_, Option<i64>>(1)?.unwrap_or(0);
-                            let ts: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
-
-                            // message_content: 先尝试读为文本，失败则读 BLOB + Zstd 解压
-                            let content = match row.get::<_, Option<String>>(3) {
-                                Ok(s) => s.unwrap_or_default(),
-                                Err(_) => {
-                                    // BLOB: 可能是 WCDB Zstd 压缩
-                                    match row.get::<_, Option<Vec<u8>>>(3) {
-                                        Ok(Some(bytes)) => decompress_wcdb_content(&bytes),
-                                        _ => String::new(),
-                                    }
-                                }
-                            };
-
-                            let msg_type: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
-
-                            let sender = match row.get::<_, Option<String>>(5) {
-                                Ok(s) => s.unwrap_or_default(),
-                                Err(_) => match row.get::<_, Option<Vec<u8>>>(5) {
-                                    Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).to_string(),
-                                    _ => String::new(),
-                                }
-                            };
-
-                            let status: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
-
-                            // source 列: 消息元数据 XML (含 atuserlist 等)
-                            let source = wcdb_get_text(row, 7);
-
-                            Ok((local_id, svr_id, ts, content, msg_type, sender, status, source))
-                        }) {
-                        Ok(rows) => rows.filter_map(|r| match r {
-                            Ok(v) => Some(v),
-                            Err(e) => { warn!("⚠️ 行解析失败: {}", e); None }
-                        }).collect(),
-                        Err(e) => { warn!("⚠️ query_map {} ({}) 失败: {}", meta.table, db_name, e); continue; }
-                    };
-
-                    if !msgs.is_empty() {
-                        let chat = resolve_chat_from_table(&meta.table, &conn, &mut name2id_cache);
-                        let mut max_id = last_id;
-                        for (local_id, server_id, create_time, content, msg_type, talker, status, source) in msgs {
-                            all_msgs.push(RawMsg {
-                                local_id, server_id, create_time, content, msg_type,
-                                talker, chat: chat.clone(), status, source,
-                            });
-                            if local_id > max_id { max_id = local_id; }
-                        }
-                        wm.insert(wm_key.clone(), max_id);
-                    }
-                }
-            }
-
-            Ok((all_msgs, wm, meta_cache))
-        }).await??;
-
-        // 回写表结构缓存
-        if let Ok(mut cache) = self.table_meta_cache.lock() {
-            for (k, v) in updated_meta {
-                cache.entry(k).or_insert(v);
-            }
-        }
-
-        // 更新高水位线
-        if !raw_msgs.is_empty() {
-            *self.watermarks.lock().await = new_watermarks;
-        }
-
-        // 异步填充显示名 (批量: 一次锁定联系人缓存, 避免 N×2 次锁竞争)
-        let contacts_cache = self.contacts.lock().await;
-        let self_display = self.self_display_name.read().await.clone();
-        let resolve = |username: &str| -> String {
-            contacts_cache
-                .get(username)
-                .map(|c| c.display_name.clone())
-                .unwrap_or_else(|| username.to_string())
-        };
-
-        let mut result = Vec::with_capacity(raw_msgs.len());
-        for m in raw_msgs {
-            let mut talker = m.talker;
-            let mut content = m.content;
-
-            // 群聊中 real_sender_id 可能为空, 此时发送人 wxid 嵌入在消息内容中
-            // 格式: "wxid_xxx:\n实际消息" 或 "wxid_xxx:\r\n实际消息"
-            if talker.is_empty() && m.chat.contains("@chatroom") {
-                if let Some(pos) = content.find(":\n") {
-                    let prefix = &content[..pos];
-                    // 验证前缀看起来像 wxid (不含空格和特殊字符)
-                    if !prefix.is_empty() && !prefix.contains(' ') && prefix.len() < 50 {
-                        talker = prefix.to_string();
-                        content = content[pos + 2..].to_string(); // 跳过 ":\n"
-                    }
-                }
-            }
-
-            // 判断是否为自己发送的消息 (基于 status 位掩码)
-            // status bit 1 (0x02): 1=收到的消息, 0=自己发的消息
-            // 注意: 系统消息 (10000/10002) 的 status 可能也为 0, 需排除
-            let base_msg_type = (m.msg_type & 0xFFFF) as i32;
-            let is_self =
-                (m.status & 0x02) == 0 && base_msg_type != 10000 && base_msg_type != 10002;
-
-            // talker 为空时填充: 自发用 self_wxid, 私聊收到用 chat(对方)
-            if talker.is_empty() {
-                if is_self {
-                    talker = self.self_wxid.clone();
-                } else if !m.chat.contains("@chatroom") {
-                    talker = m.chat.clone();
-                }
-            }
-
-            let talker_display = if is_self {
-                self_display.clone()
-            } else {
-                resolve(&talker)
-            };
-            let chat_display = resolve(&m.chat);
-            // 非文本消息: 输出原始 content 前 200 字符用于调试 XML 解析
-            let base_type = (m.msg_type & 0xFFFF) as i32;
-            if base_type != 1 {
-                let raw_preview = if content.len() > 200 {
-                    format!("{}...", &content[..content.floor_char_boundary(200)])
-                } else {
-                    content.clone()
-                };
-                debug!(
-                    "🔍 msg_type={} (base={}) raw: {}",
-                    m.msg_type, base_type, raw_preview
-                );
-            }
-            let parsed = parse_msg_content(m.msg_type, &content);
-
-            // 解析 @ 列表: 从 source 列的 <atuserlist> 提取被 @ 者的 wxid
-            let at_user_list: Vec<String> = extract_xml_text(&m.source, "atuserlist")
-                .map(|s| {
-                    s.split(',')
-                        .map(|w| w.trim().to_string())
-                        .filter(|w| !w.is_empty())
-                        .collect()
                 })
-                .unwrap_or_default();
-            let is_at_me =
-                !self.self_wxid.is_empty() && at_user_list.iter().any(|w| w == &self.self_wxid);
-
-            result.push(DbMessage {
-                local_id: m.local_id,
-                server_id: m.server_id,
-                create_time: m.create_time,
-                content: content.clone(),
-                parsed,
-                msg_type: m.msg_type,
-                talker,
-                talker_display_name: talker_display,
-                chat: m.chat,
-                chat_display_name: chat_display,
-                is_self,
-                is_at_me,
-                at_user_list,
-            });
-
-            // 自发消息广播: 通知 verify_sent 等待者
-            if is_self {
-                let _ = self.sent_content_tx.send(content);
-            }
-        }
-        drop(contacts_cache); // 显式释放锁
-
-        for m in &result {
-            let preview = m.parsed.preview(40);
-            let icon = if m.is_self { "📤 →" } else { "📨" };
-            if m.chat.contains("@chatroom") {
-                info!(
-                    "{icon} [{}] {}({}): {}",
-                    m.chat_display_name, m.talker_display_name, m.talker, preview
-                );
-            } else {
-                info!("{icon} {}({}): {}", m.chat_display_name, m.talker, preview);
-            }
-        }
-        Ok(result)
+                .collect();
+            Ok(rows)
+        })
+        .await?
     }
 
-    /// 标记所有已有消息为已读 (复用持久连接 + 复用表元数据构建)
-    pub async fn mark_all_read(&self) -> Result<()> {
-        // 克隆 Arc 引用传入 spawn_blocking
-        let conn_arcs: Vec<(String, Arc<std::sync::Mutex<Connection>>)> = {
-            let conns_guard = self.ensure_msg_conns()?;
-            conns_guard
-                .iter()
-                .map(|(name, conn)| (name.clone(), Arc::clone(conn)))
-                .collect()
+    pub async fn prime_session_state(&self) -> Result<usize> {
+        let snapshots = self.load_session_snapshots().await?;
+        let count = snapshots.len();
+        let mut state = self.session_state.lock().await;
+        state.clear();
+        for snapshot in snapshots {
+            state.insert(snapshot.username.clone(), snapshot);
+        }
+        Ok(count)
+    }
+
+    fn is_session_update(prev: Option<&SessionSnapshot>, curr: &SessionSnapshot) -> bool {
+        match prev {
+            None => false,
+            Some(prev) => {
+                curr.last_timestamp > prev.last_timestamp
+                    || (curr.last_timestamp == prev.last_timestamp
+                        && (curr.last_msg_type != prev.last_msg_type
+                            || curr.summary != prev.summary))
+            }
+        }
+    }
+
+    async fn build_message_from_session(&self, snapshot: &SessionSnapshot) -> DbMessage {
+        let chat_display = self.resolve_name(&snapshot.username).await;
+        let summary = strip_session_summary(&snapshot.summary);
+        let base_msg_type = (snapshot.last_msg_type & 0xFFFF) as i32;
+
+        let inferred_self = if snapshot.username.contains("@chatroom") {
+            !self.self_wxid.is_empty() && snapshot.last_msg_sender == self.self_wxid
+        } else {
+            (!self.self_wxid.is_empty() && snapshot.last_msg_sender == self.self_wxid)
+                || (snapshot.last_msg_sender.is_empty() && snapshot.unread_count == 0)
         };
 
-        let wm = tokio::task::spawn_blocking(move || -> Result<HashMap<String, i64>> {
-            let mut watermarks = HashMap::new();
-            let mut total_tables = 0;
-
-            for (db_name, conn_arc) in &conn_arcs {
-                let conn = conn_arc
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("conn lock: {}", e))?;
-                let db_prefix = db_name
-                    .trim_start_matches("message/")
-                    .trim_end_matches(".db");
-
-                // 复用 discover_msg_tables + build_single_table_meta (消除重复 PRAGMA)
-                let tables = discover_msg_tables(&conn);
-                for table in &tables {
-                    if let Some(meta) = build_single_table_meta(&conn, table) {
-                        let wm_key = format!("{}::{}", db_prefix, table);
-                        let sql = format!("SELECT MAX({}) FROM [{}]", meta.id_col, table);
-                        if let Ok(max_id) =
-                            conn.query_row(&sql, [], |row| row.get::<_, Option<i64>>(0))
-                        {
-                            if let Some(id) = max_id {
-                                watermarks.insert(wm_key, id);
-                            }
-                        }
-                    }
-                }
-                total_tables += tables.len();
+        let talker = if snapshot.username.contains("@chatroom") {
+            if inferred_self {
+                self.self_wxid.clone()
+            } else if !snapshot.last_msg_sender.is_empty() {
+                snapshot.last_msg_sender.clone()
+            } else {
+                snapshot.username.clone()
             }
-            info!(
-                "✅ 已标记 {} 个消息表为已读 (跨 {} 个数据库)",
-                total_tables,
-                conn_arcs.len()
-            );
-            Ok(watermarks)
-        })
-        .await??;
+        } else if inferred_self {
+            self.self_wxid.clone()
+        } else if !snapshot.last_msg_sender.is_empty() {
+            snapshot.last_msg_sender.clone()
+        } else {
+            snapshot.username.clone()
+        };
 
-        *self.watermarks.lock().await = wm;
-        Ok(())
+        let talker_display_name = if inferred_self {
+            self.self_display_name.read().await.clone()
+        } else if snapshot.username.contains("@chatroom") && !snapshot.last_sender_display_name.is_empty()
+        {
+            snapshot.last_sender_display_name.clone()
+        } else {
+            self.resolve_name(&talker).await
+        };
+
+        let parsed = parse_msg_content(base_msg_type as i64, &summary);
+
+        DbMessage {
+            local_id: 0,
+            server_id: 0,
+            create_time: snapshot.last_timestamp,
+            content: summary,
+            parsed,
+            msg_type: base_msg_type as i64,
+            talker,
+            talker_display_name,
+            chat: snapshot.username.clone(),
+            chat_display_name: chat_display,
+            is_self: inferred_self,
+            is_at_me: false,
+            at_user_list: Vec::new(),
+        }
+    }
+
+    /// 获取新消息 (基于 session.db 的 SessionTable 变化)
+    pub async fn get_new_messages(&self) -> Result<Vec<DbMessage>> {
+        let snapshots = self.load_session_snapshots().await?;
+        let previous = self.session_state.lock().await.clone();
+        let mut current = HashMap::with_capacity(snapshots.len());
+        let mut updates = Vec::new();
+
+        for snapshot in snapshots {
+            let prev = previous.get(&snapshot.username);
+            if Self::is_session_update(prev, &snapshot) {
+                let msg = self.build_message_from_session(&snapshot).await;
+                updates.push(msg);
+            }
+            current.insert(snapshot.username.clone(), snapshot);
+        }
+
+        *self.session_state.lock().await = current;
+
+        for msg in &updates {
+            if msg.is_self && !msg.content.is_empty() {
+                let _ = self.sent_content_tx.send(msg.content.clone());
+            }
+
+            let preview = msg.parsed.preview(40);
+            let icon = if msg.is_self { "📤 →" } else { "📨" };
+            if msg.chat.contains("@chatroom") {
+                info!(
+                    "{icon} [{}] {}({}): {}",
+                    msg.chat_display_name, msg.talker_display_name, msg.talker, preview
+                );
+            } else {
+                info!("{icon} {}({}): {}", msg.chat_display_name, msg.talker, preview);
+            }
+        }
+
+        Ok(updates)
     }
 
     // =================================================================
@@ -1079,17 +868,17 @@ impl DbManager {
         self.sent_content_tx.subscribe()
     }
 
-    /// 订阅 WAL 变化通知
+    /// 订阅 session.db 变化通知
     #[allow(dead_code)]
     pub fn subscribe_wal_events(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.wal_notify.subscribe()
     }
 
     // =================================================================
-    // WAL fanotify 监听 (PID 过滤)
+    // session.db mtime 监听
     // =================================================================
 
-    /// 启动 WAL 文件监听 (fanotify + PID 过滤, 在独立线程运行)
+    /// 启动 session.db 变化监听 (mtime 轮询, 在独立线程运行)
     ///
     /// 返回 broadcast::Receiver, 支持多消费者 (消息循环 + verify_sent 等)
     pub fn spawn_wal_watcher(self: &Arc<Self>) -> tokio::sync::broadcast::Receiver<()> {
@@ -1098,11 +887,11 @@ impl DbManager {
 
         std::thread::spawn(move || {
             if let Err(e) = wal_watch_loop(&db_dir, wal_tx) {
-                error!("❌ WAL 监听退出: {}", e);
+                error!("❌ Session 监听退出: {}", e);
             }
         });
 
-        info!("👁️ WAL 文件监听已启动 (fanotify PID 过滤, broadcast)");
+        info!("👁️ Session DB 监听已启动 (mtime 轮询, 30ms)");
         self.wal_notify.subscribe()
     }
 }
@@ -1111,137 +900,49 @@ impl DbManager {
 // 同步辅助函数
 // =====================================================================
 
-/// 从消息表名解析会话 username
-/// ChatMsg_<rowid> -> Name2Id.user_name WHERE rowid = <id>
-/// Msg_<hash> -> MD5(Name2Id.user_name) == hash (使用缓存 O(1) 查找)
-fn resolve_chat_from_table(
-    table_name: &str,
-    conn: &Connection,
-    cache: &mut HashMap<String, String>,
-) -> String {
-    // 尝试 ChatMsg_<数字> 格式 -> 按 rowid 查找
-    if let Some(suffix) = table_name.strip_prefix("ChatMsg_") {
-        if let Ok(id) = suffix.parse::<i64>() {
-            let sql = "SELECT user_name FROM Name2Id WHERE rowid = ?1";
-            if let Ok(name) = conn.query_row(sql, [id], |row| row.get::<_, String>(0)) {
-                debug!("✅ ChatMsg rowid={} -> {}", id, name);
-                return name;
-            }
-        }
-    }
-
-    // 尝试 Msg_<hash> / MSG_<hash> / Chat_<hash> 格式
-    if let Some(hash) = table_name
-        .strip_prefix("Msg_")
-        .or_else(|| table_name.strip_prefix("MSG_"))
-        .or_else(|| table_name.strip_prefix("Chat_"))
-    {
-        // 懒加载: 首次查找时构建 MD5 hash → username 缓存
-        if cache.is_empty() {
-            if let Ok(mut stmt) = conn.prepare("SELECT user_name FROM Name2Id") {
-                if let Ok(names) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-                    for name in names.flatten() {
-                        let name_hash = format!("{:x}", md5::compute(name.as_bytes()));
-                        cache.insert(name_hash, name);
-                    }
-                }
-            }
-            debug!("📦 Name2Id 缓存已构建: {} 条", cache.len());
-        }
-
-        // O(1) 查找
-        if let Some(name) = cache.get(hash) {
-            debug!("✅ Msg hash={} -> user_name={}", hash, name);
-            return name.clone();
-        }
-        debug!("⚠️ hash={} 未在 Name2Id 中找到匹配", hash);
-    }
-
-    debug!("⚠️ 无法解析会话名: {}", table_name);
-    table_name.to_string()
-}
-
 // =====================================================================
-// WAL 监听 (fanotify PID 过滤, 在 std::thread 中运行)
+// session.db 监听 (mtime 轮询, 在 std::thread 中运行)
 // =====================================================================
 
 fn wal_watch_loop(db_dir: &Path, tx: tokio::sync::broadcast::Sender<()>) -> Result<()> {
-    use fanotify::high_level::*;
+    let session_dir = db_dir.join("session");
+    let session_db = session_dir.join("session.db");
+    let session_wal = session_dir.join("session.db-wal");
+    let poll_interval = std::time::Duration::from_millis(30);
 
-    let self_pid = std::process::id() as i32;
-    debug!("fanotify PID 过滤: self_pid={}", self_pid);
-
-    let msg_dir = db_dir.join("message");
-
-    // 等待 message 目录创建 (轮询, 仅启动时执行一次)
-    if !msg_dir.exists() {
-        debug!("等待 message 目录创建: {}", msg_dir.display());
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            if msg_dir.exists() {
-                debug!("message 目录已创建");
-                break;
-            }
-        }
+    while !session_db.exists() {
+        debug!("等待 session.db 创建: {}", session_db.display());
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
-
-    // 等待 WAL 文件创建 (轮询)
-    let wal_path = msg_dir.join("message_0.db-wal");
-    if !wal_path.exists() {
-        debug!("等待 WAL 文件: {}", wal_path.display());
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            if wal_path.exists() {
-                debug!("WAL 文件已创建");
-                break;
-            }
-        }
-    }
-
-    // 初始化 fanotify (通知模式, 阻塞读取)
-    let fan = Fanotify::new_blocking(FanotifyMode::NOTIF).with_context(|| "fanotify 初始化失败")?;
-
-    // 使用 FAN_MARK_MOUNT (挂载点级别标记) 而非 add_path (Inode 级标记)
-    // 原因: add_path 对目录的 Inode 标记只监听目录自身的修改,
-    //       不会报告目录内子文件(WAL/SHM)的 FAN_MODIFY 事件,
-    //       除非额外附加 FAN_EVENT_ON_CHILD 标志.
-    //       add_mountpoint 使用 FAN_MARK_MOUNT, 覆盖整个挂载点上的所有文件,
-    //       包括子目录和嵌套文件, 无需 FAN_EVENT_ON_CHILD.
-    fan.add_mountpoint(FanEvent::Modify.into(), &msg_dir)
-        .with_context(|| format!("fanotify add_mountpoint 失败: {}", msg_dir.display()))?;
 
     debug!(
-        "开始监听 WAL: {} (fanotify FAN_MARK_MOUNT)",
-        wal_path.display()
+        "开始监听 session mtime: db={} wal={}",
+        session_db.display(),
+        session_wal.display()
     );
 
-    let msg_dir_prefix = msg_dir.to_string_lossy().to_string();
+    let mut prev_db = file_mtime(&session_db);
+    let mut prev_wal = file_mtime(&session_wal);
 
     loop {
-        let events = fan.read_event();
-        // 注: Event.fd 由 fanotify-rs 的 Drop trait 自动关闭, 无需手动 close
+        std::thread::sleep(poll_interval);
 
-        let mut has_external_modify = false;
-        for event in events {
-            // 核心 PID 过滤: 丢弃自身进程触发的事件
-            if event.pid == self_pid {
-                continue;
-            }
-
-            // 路径过滤: 只关心 message/ 目录下的文件 (忽略挂载点其他文件)
-            if !event.path.starts_with(&msg_dir_prefix) {
-                continue;
-            }
-
-            // 外部进程修改了消息数据库文件 → 触发消息检查
-            trace!("📝 外部 MODIFY (pid={}): {}", event.pid, event.path);
-            has_external_modify = true;
+        let curr_db = file_mtime(&session_db);
+        let curr_wal = file_mtime(&session_wal);
+        if curr_db == prev_db && curr_wal == prev_wal {
+            continue;
         }
 
-        if has_external_modify {
-            // 直接通知, 无需冷却期!
-            let _ = tx.send(());
-        }
+        trace!(
+            "📝 session mtime 变化: db={:?}->{:?} wal={:?}->{:?}",
+            prev_db,
+            curr_db,
+            prev_wal,
+            curr_wal
+        );
+        prev_db = curr_db;
+        prev_wal = curr_wal;
+        let _ = tx.send(());
     }
 }
 
@@ -1262,6 +963,21 @@ fn decompress_wcdb_content(blob: &[u8]) -> String {
     String::from_utf8_lossy(blob).to_string()
 }
 
+fn strip_session_summary(summary: &str) -> String {
+    let summary = summary.trim();
+    if let Some((_, content)) = summary.split_once(":\n") {
+        return content.trim().to_string();
+    }
+    if let Some((_, content)) = summary.split_once(":\r\n") {
+        return content.trim().to_string();
+    }
+    summary.to_string()
+}
+
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 /// WCDB 兼容读取: 先尝试 TEXT, 失败则 BLOB + Zstd 解压
 /// (WCDB 压缩可能导致 TEXT 列实际存储为 BLOB)
 fn wcdb_get_text(row: &rusqlite::Row, idx: usize) -> String {
@@ -1272,122 +988,6 @@ fn wcdb_get_text(row: &rusqlite::Row, idx: usize) -> String {
             _ => String::new(),
         },
     }
-}
-
-/// 查询 sqlite_master 获取消息表列表 (每次调用, 发现新表)
-fn discover_msg_tables(conn: &Connection) -> Vec<String> {
-    match conn.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND \
-         (name LIKE 'ChatMsg_%' OR name LIKE 'MSG_%' OR name LIKE 'Chat_%')",
-    ) {
-        Ok(mut stmt) => stmt
-            .query_map([], |row| row.get(0))
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// 对单个消息表执行 PRAGMA table_info → 构建 TableMeta (仅新表调用一次)
-fn build_single_table_meta(conn: &Connection, table: &str) -> Option<TableMeta> {
-    let pragma_sql = format!("PRAGMA table_info({})", table);
-    let mut pragma_stmt = conn.prepare(&pragma_sql).ok()?;
-    let columns: Vec<String> = pragma_stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .ok()?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let id_col = columns
-        .iter()
-        .find(|c| {
-            c.eq_ignore_ascii_case("local_id")
-                || c.eq_ignore_ascii_case("localId")
-                || c.eq_ignore_ascii_case("rowid")
-        })
-        .cloned()
-        .unwrap_or_else(|| "rowid".to_string());
-
-    let time_col = columns
-        .iter()
-        .find(|c| c.eq_ignore_ascii_case("create_time") || c.eq_ignore_ascii_case("createTime"))
-        .cloned();
-
-    let content_col = columns
-        .iter()
-        .find(|c| {
-            c.eq_ignore_ascii_case("message_content")
-                || c.eq_ignore_ascii_case("content")
-                || c.eq_ignore_ascii_case("msgContent")
-                || c.eq_ignore_ascii_case("compress_content")
-        })
-        .cloned();
-
-    let type_col = columns
-        .iter()
-        .find(|c| {
-            c.eq_ignore_ascii_case("local_type")
-                || c.eq_ignore_ascii_case("type")
-                || c.eq_ignore_ascii_case("msgType")
-        })
-        .cloned();
-
-    let talker_col = columns
-        .iter()
-        .find(|c| {
-            c.eq_ignore_ascii_case("real_sender_id")
-                || c.eq_ignore_ascii_case("talker")
-                || c.eq_ignore_ascii_case("talkerId")
-        })
-        .cloned();
-
-    let svr_col = columns
-        .iter()
-        .find(|c| {
-            c.eq_ignore_ascii_case("server_id")
-                || c.eq_ignore_ascii_case("svrid")
-                || c.eq_ignore_ascii_case("msgSvrId")
-        })
-        .cloned();
-
-    let content_sel = content_col.as_deref()?;
-    let time_sel = time_col.as_deref().unwrap_or("0");
-    let type_sel = type_col.as_deref().unwrap_or("0");
-    let talker_sel = talker_col.as_deref().unwrap_or("''");
-    let svr_sel = svr_col.as_deref().unwrap_or("0");
-
-    let status_col = columns
-        .iter()
-        .find(|c| c.eq_ignore_ascii_case("status"))
-        .cloned();
-    let status_sel = status_col.as_deref().unwrap_or("0");
-
-    let source_col = columns
-        .iter()
-        .find(|c| c.eq_ignore_ascii_case("source"))
-        .cloned();
-    let source_sel = source_col.as_deref().unwrap_or("''");
-
-    let select_sql = format!(
-        "SELECT {id}, {svr}, {time}, {content}, {typ}, {talker}, {status}, {source} \
-         FROM [{tbl}] WHERE {id} > ?1 ORDER BY {id} ASC",
-        id = id_col,
-        svr = svr_sel,
-        time = time_sel,
-        content = content_sel,
-        typ = type_sel,
-        talker = talker_sel,
-        status = status_sel,
-        source = source_sel,
-        tbl = table,
-    );
-
-    Some(TableMeta {
-        table: table.to_string(),
-        select_sql,
-        id_col,
-    })
 }
 
 /// 根据 msg_type 解析原始 content 为结构化 MsgContent
