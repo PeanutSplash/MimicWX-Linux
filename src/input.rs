@@ -870,6 +870,14 @@ pub fn capture_screenshot() -> Result<Vec<u8>> {
         ));
     } else {
         for (win, name, w, h) in &wechat_wins {
+            // 截图前将窗口提升到最前, 避免被遮挡区域返回黑色 (无合成器时)
+            let _ = conn.configure_window(
+                *win,
+                &xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
+            );
+            let _ = conn.flush();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
             if let Some(image) = conn
                 .get_image(xproto::ImageFormat::Z_PIXMAP, *win, 0, 0, *w, *h, !0)
                 .ok()
