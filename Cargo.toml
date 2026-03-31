@@ -1,6 +1,6 @@
 [package]
 name = "mimicwx"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Zero-risk WeChat automation framework for Linux via AT-SPI2 + X11 XTEST + SQLCipher"
 license = "MIT"
@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Utils
 anyhow = "1"
+arc-swap = "1"
 async-trait = "0.1"
 hmac = "0.12"
 md5 = "0.7"

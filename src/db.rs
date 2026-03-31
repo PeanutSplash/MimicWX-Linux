@@ -14,6 +14,7 @@
 //! 策略: 所有 DB 操作在 spawn_blocking 中完成, 异步方法只操作缓存。
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -56,19 +57,58 @@ pub enum MsgContent {
     /// 纯文本 (msg_type=1)
     Text { text: String },
     /// 图片 (msg_type=3)
-    Image { path: Option<String> },
+    Image {
+        path: Option<String>,
+        md5: Option<String>,
+        length: Option<u64>,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
     /// 语音 (msg_type=34)
-    Voice { duration_ms: Option<u32> },
+    Voice {
+        duration_ms: Option<u32>,
+        voice_url: Option<String>,
+        aeskey: Option<String>,
+    },
     /// 视频 (msg_type=43)
-    Video { thumb_path: Option<String> },
+    Video {
+        thumb_path: Option<String>,
+        cdn_video_url: Option<String>,
+        aeskey: Option<String>,
+        length: Option<u64>,
+        play_length: Option<u32>,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
     /// 表情包 (msg_type=47)
     Emoji { url: Option<String> },
-    /// 链接/文件/小程序 (msg_type=49)
+    /// 链接/小程序 (msg_type=49, subtype != 6)
     App {
         title: Option<String>,
         desc: Option<String>,
         url: Option<String>,
         app_type: Option<i32>,
+    },
+    /// 文件 (msg_type=49, subtype=6)
+    File {
+        title: Option<String>,
+        file_size: Option<u64>,
+        file_ext: Option<String>,
+        md5: Option<String>,
+    },
+    /// 名片 (msg_type=42)
+    ContactCard {
+        nickname: Option<String>,
+        username: Option<String>,
+        avatar_url: Option<String>,
+    },
+    /// 位置 (msg_type=48)
+    Location {
+        x: Option<f64>,
+        y: Option<f64>,
+        scale: Option<u32>,
+        label: Option<String>,
+        poiname: Option<String>,
     },
     /// 系统消息 (msg_type=10000/10002)
     System { text: String },
@@ -87,6 +127,9 @@ impl MsgContent {
             Self::Video { .. } => "视频",
             Self::Emoji { .. } => "表情",
             Self::App { .. } => "链接",
+            Self::File { .. } => "文件",
+            Self::ContactCard { .. } => "名片",
+            Self::Location { .. } => "位置",
             Self::System { .. } => "系统",
             Self::Unknown { .. } => "未知",
         }
@@ -112,39 +155,13 @@ impl MsgContent {
             } => {
                 let t = title.as_deref().unwrap_or("");
                 let d = desc.as_deref().unwrap_or("");
-                // 子类型 + 标题后缀推断
                 let label = match app_type.unwrap_or(0) {
                     3 => "音乐",
-                    6 => "文件",
                     19 => "转发",
                     33 | 36 => "小程序",
-                    42 => "名片",
                     2000 => "转账",
                     2001 => "红包",
-                    _ => {
-                        // 子类型提取失败时, 用标题后缀推断文件
-                        let tl = t.to_lowercase();
-                        if tl.ends_with(".pdf")
-                            || tl.ends_with(".doc")
-                            || tl.ends_with(".docx")
-                            || tl.ends_with(".xls")
-                            || tl.ends_with(".xlsx")
-                            || tl.ends_with(".ppt")
-                            || tl.ends_with(".pptx")
-                            || tl.ends_with(".zip")
-                            || tl.ends_with(".rar")
-                            || tl.ends_with(".7z")
-                            || tl.ends_with(".txt")
-                            || tl.ends_with(".csv")
-                            || tl.ends_with(".apk")
-                            || tl.ends_with(".exe")
-                            || tl.ends_with(".dmg")
-                        {
-                            "文件"
-                        } else {
-                            "链接"
-                        }
-                    }
+                    _ => "链接",
                 };
                 if !t.is_empty() {
                     format!("[{label}] {t}")
@@ -152,6 +169,47 @@ impl MsgContent {
                     format!("[{label}] {d}")
                 } else {
                     format!("[{label}]")
+                }
+            }
+            Self::File {
+                title, file_size, ..
+            } => {
+                let t = title.as_deref().unwrap_or("未知文件");
+                match file_size {
+                    Some(s) if *s >= 1024 * 1024 => {
+                        format!("[文件] {} ({:.1}MB)", t, *s as f64 / 1024.0 / 1024.0)
+                    }
+                    Some(s) if *s >= 1024 => {
+                        format!("[文件] {} ({:.1}KB)", t, *s as f64 / 1024.0)
+                    }
+                    Some(s) => format!("[文件] {} ({}B)", t, s),
+                    None => format!("[文件] {}", t),
+                }
+            }
+            Self::ContactCard {
+                nickname, username, ..
+            } => {
+                let name = nickname
+                    .as_deref()
+                    .or(username.as_deref())
+                    .unwrap_or("未知");
+                format!("[名片] {}", name)
+            }
+            Self::Location {
+                poiname,
+                label,
+                x,
+                y,
+                ..
+            } => {
+                let name = poiname
+                    .as_deref()
+                    .or(label.as_deref())
+                    .unwrap_or("未知位置");
+                if let (Some(lat), Some(lng)) = (x, y) {
+                    format!("[位置] {} ({:.4},{:.4})", name, lat, lng)
+                } else {
+                    format!("[位置] {}", name)
                 }
             }
             Self::System { text } => format!("[系统] {text}"),
@@ -214,8 +272,8 @@ pub struct DbManager {
     self_wxid: String,
     /// 当前账号的显示名 (从联系人库查询, 默认 "我")
     self_display_name: tokio::sync::RwLock<String>,
-    /// 联系人缓存: username → ContactInfo
-    contacts: Mutex<HashMap<String, ContactInfo>>,
+    /// 联系人缓存: username → ContactInfo (ArcSwap 快照, 读取零竞争)
+    contacts: ArcSwap<HashMap<String, ContactInfo>>,
     /// SessionTable 快照: username → 最新摘要/时间戳
     session_state: Mutex<HashMap<String, SessionSnapshot>>,
     /// 持久化 contact.db 连接 (避免每次重做 PBKDF2)
@@ -269,7 +327,7 @@ impl DbManager {
             db_dir,
             self_wxid,
             self_display_name: tokio::sync::RwLock::new("我".to_string()),
-            contacts: Mutex::new(HashMap::new()),
+            contacts: ArcSwap::from_pointee(HashMap::new()),
             session_state: Mutex::new(HashMap::new()),
             contact_conn: Arc::new(std::sync::Mutex::new(None)),
             session_conn: Arc::new(std::sync::Mutex::new(None)),
@@ -477,14 +535,14 @@ impl DbManager {
         .await??;
 
         let count = contacts.len();
-        // 短暂持锁: 清空并填入联系人
+        // 原子替换联系人快照 (无锁)
         {
-            let mut cache = self.contacts.lock().await;
-            cache.clear();
+            let mut new_map = HashMap::with_capacity(contacts.len());
             for c in contacts {
-                cache.insert(c.username.clone(), c);
+                new_map.insert(c.username.clone(), c);
             }
-        } // 锁在此释放, 不阻塞 get_new_messages 等热路径
+            self.contacts.store(Arc::new(new_map));
+        }
         debug!("联系人缓存: {} 条", count);
 
         // 从 chat_room 表补充群名 (锁已释放, spawn_blocking 不会阻塞读操作)
@@ -528,13 +586,14 @@ impl DbManager {
             .unwrap_or_default()
         };
 
-        // 短暂持锁: 补充群名
+        // 原子替换: 补充群名到快照
         if !chatrooms.is_empty() {
-            let mut cache = self.contacts.lock().await;
+            let old = self.contacts.load();
+            let mut new_map = (**old).clone();
             let mut added = 0usize;
             for (chatroom_id, nick_name) in chatrooms {
-                if !cache.contains_key(&chatroom_id) {
-                    cache.insert(
+                if !new_map.contains_key(&chatroom_id) {
+                    new_map.insert(
                         chatroom_id.clone(),
                         ContactInfo {
                             username: chatroom_id,
@@ -548,16 +607,16 @@ impl DbManager {
                 }
             }
             if added > 0 {
+                self.contacts.store(Arc::new(new_map));
                 debug!("群聊名称补充: {} 条", added);
             }
         }
 
-        // 尝试解析当前账号的显示名 (短暂持锁读取, 然后释放)
+        // 尝试解析当前账号的显示名 (快照读取, 无锁)
         if !self.self_wxid.is_empty() {
             let name = self
                 .contacts
-                .lock()
-                .await
+                .load()
                 .get(&self.self_wxid)
                 .map(|c| c.display_name.clone());
             if let Some(name) = name {
@@ -571,14 +630,13 @@ impl DbManager {
 
     /// 获取联系人列表
     pub async fn get_contacts(&self) -> Vec<ContactInfo> {
-        self.contacts.lock().await.values().cloned().collect()
+        self.contacts.load().values().cloned().collect()
     }
 
     /// 通过 username 获取显示名
     async fn resolve_name(&self, username: &str) -> String {
         self.contacts
-            .lock()
-            .await
+            .load()
             .get(username)
             .map(|c| c.display_name.clone())
             .unwrap_or_else(|| username.to_string())
@@ -1014,6 +1072,7 @@ fn parse_msg_content(msg_type: i64, content: &str) -> MsgContent {
         42 => parse_contact_card(content),
         43 => parse_video(content),
         47 => parse_emoji(content),
+        48 => parse_location(content),
         49 => parse_app(content),
         10000 | 10002 => MsgContent::System {
             text: content.to_string(),
@@ -1025,46 +1084,102 @@ fn parse_msg_content(msg_type: i64, content: &str) -> MsgContent {
     }
 }
 
-/// 图片消息: 从 XML 中提取 CDN URL
+/// 图片消息: 从 XML 中提取 CDN URL + 元数据
 fn parse_image(content: &str) -> MsgContent {
     let path = extract_xml_attr(content, "img", "cdnmidimgurl")
         .or_else(|| extract_xml_attr(content, "img", "cdnbigimgurl"));
-    MsgContent::Image { path }
+    let md5 = extract_xml_attr(content, "img", "md5");
+    let length = extract_xml_attr(content, "img", "length").and_then(|v| v.parse::<u64>().ok());
+    let width = extract_xml_attr(content, "img", "cdnmidwidth")
+        .or_else(|| extract_xml_attr(content, "img", "cdnthumbwidth"))
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0);
+    let height = extract_xml_attr(content, "img", "cdnmidheight")
+        .or_else(|| extract_xml_attr(content, "img", "cdnthumbheight"))
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0);
+    MsgContent::Image {
+        path,
+        md5,
+        length,
+        width,
+        height,
+    }
 }
 
-/// 语音消息: 尝试多种属性名提取时长
+/// 语音消息: 提取时长 + CDN URL + AES 密钥
 fn parse_voice(content: &str) -> MsgContent {
     let duration_ms = extract_xml_attr(content, "voicemsg", "voicelength")
         .or_else(|| extract_xml_attr(content, "voicemsg", "voicelen"))
         .or_else(|| extract_xml_attr(content, "voicemsg", "length"))
         .and_then(|v| v.parse::<u32>().ok());
-    MsgContent::Voice { duration_ms }
-}
-
-/// 名片消息 (msg_type=42): 提取昵称和 wxid
-fn parse_contact_card(content: &str) -> MsgContent {
-    let nickname = extract_xml_attr(content, "msg", "nickname")
-        .or_else(|| extract_xml_attr(content, "msg", "smallheadimgurl"));
-    let username = extract_xml_attr(content, "msg", "username");
-    let title = nickname.or(username);
-    MsgContent::App {
-        title,
-        desc: Some("名片".to_string()),
-        url: None,
-        app_type: Some(42),
+    let voice_url = extract_xml_attr(content, "voicemsg", "voiceurl");
+    let aeskey = extract_xml_attr(content, "voicemsg", "aeskey");
+    MsgContent::Voice {
+        duration_ms,
+        voice_url,
+        aeskey,
     }
 }
 
-/// 视频消息: 提取 cdnthumburl
+/// 名片消息 (msg_type=42): 提取昵称、wxid、头像
+fn parse_contact_card(content: &str) -> MsgContent {
+    let nickname = extract_xml_attr(content, "msg", "nickname");
+    let username = extract_xml_attr(content, "msg", "username");
+    let avatar_url = extract_xml_attr(content, "msg", "smallheadimgurl");
+    MsgContent::ContactCard {
+        nickname,
+        username,
+        avatar_url,
+    }
+}
+
+/// 视频消息: 提取缩略图 + 视频 CDN + 元数据
 fn parse_video(content: &str) -> MsgContent {
     let thumb_path = extract_xml_attr(content, "videomsg", "cdnthumburl");
-    MsgContent::Video { thumb_path }
+    let cdn_video_url = extract_xml_attr(content, "videomsg", "cdnvideourl");
+    let aeskey = extract_xml_attr(content, "videomsg", "aeskey");
+    let length = extract_xml_attr(content, "videomsg", "length").and_then(|v| v.parse::<u64>().ok());
+    let play_length =
+        extract_xml_attr(content, "videomsg", "playlength").and_then(|v| v.parse::<u32>().ok());
+    let width = extract_xml_attr(content, "videomsg", "cdnthumbwidth")
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0);
+    let height = extract_xml_attr(content, "videomsg", "cdnthumbheight")
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0);
+    MsgContent::Video {
+        thumb_path,
+        cdn_video_url,
+        aeskey,
+        length,
+        play_length,
+        width,
+        height,
+    }
 }
 
 /// 表情消息: 提取 cdnurl
 fn parse_emoji(content: &str) -> MsgContent {
     let url = extract_xml_attr(content, "emoji", "cdnurl");
     MsgContent::Emoji { url }
+}
+
+/// 位置消息 (msg_type=48): 提取坐标、名称、地址
+fn parse_location(content: &str) -> MsgContent {
+    let x = extract_xml_attr(content, "location", "x").and_then(|v| v.parse::<f64>().ok());
+    let y = extract_xml_attr(content, "location", "y").and_then(|v| v.parse::<f64>().ok());
+    let scale =
+        extract_xml_attr(content, "location", "scale").and_then(|v| v.parse::<u32>().ok());
+    let label = extract_xml_attr(content, "location", "label");
+    let poiname = extract_xml_attr(content, "location", "poiname");
+    MsgContent::Location {
+        x,
+        y,
+        scale,
+        label,
+        poiname,
+    }
 }
 
 /// 链接/文件/小程序消息 (msg_type=49): 解析 appmsg XML
@@ -1074,6 +1189,31 @@ fn parse_app(content: &str) -> MsgContent {
     let desc = extract_xml_text(content, "des");
     let url = extract_xml_text(content, "url");
     let app_type = extract_xml_text(content, "type").and_then(|t| t.parse::<i32>().ok());
+
+    // 文件消息判定 (组合策略):
+    // 1. 已知文件子类型: 6 (标准文件), 74 (新版文件传输)
+    // 2. 兜底: <appattach> + <fileext> + totallen > 0 同时满足
+    let is_file = matches!(app_type, Some(6) | Some(74))
+        || (content.contains("<appattach>")
+            && content.contains("<fileext>")
+            && extract_xml_text(content, "totallen")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+                > 0);
+    if is_file {
+        let file_size = extract_xml_text(content, "totallen")
+            .or_else(|| extract_xml_text(content, "filesize"))
+            .and_then(|v| v.parse::<u64>().ok());
+        let file_ext = extract_xml_text(content, "fileext");
+        let md5 = extract_xml_text(content, "md5");
+        return MsgContent::File {
+            title,
+            file_size,
+            file_ext,
+            md5,
+        };
+    }
+
     MsgContent::App {
         title,
         desc,
